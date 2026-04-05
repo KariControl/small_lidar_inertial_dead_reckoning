@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>pure_odometry_bringup</name>
+  <version>0.1.0</version>
+  <description>Minimal bringup package for the IMU undistorter + lidar gyro odometer subset.</description>
+
+  <maintainer email="noreply@example.com">pure_localization</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>rclcpp_components</exec_depend>
+  <exec_depend>diagnostic_aggregator</exec_depend>
+  <exec_depend>pure_imu_undistortion</exec_depend>
+  <exec_depend>pure_lidar_gyro_odometer</exec_depend>
+  <exec_depend>pure_gnss_conversion</exec_depend>
+  <exec_depend>pure_gnss_map_odom_fusion</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

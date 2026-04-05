@@ -1,0 +1,21 @@
+diagnostic_aggregator:
+  ros__parameters:
+    pub_rate: 10.0
+    base_path: localization
+    analyzers:
+      imu_undistortion:
+        type: diagnostic_aggregator/GenericAnalyzer
+        path: imu_undistortion
+        startswith: ["localization/imu_undistortion"]
+      gyro_odometer:
+        type: diagnostic_aggregator/GenericAnalyzer
+        path: gyro_odometer
+        startswith: ["localization/gyro_odometer"]
+      gnss_conversion:
+        type: diagnostic_aggregator/GenericAnalyzer
+        path: gnss_conversion
+        startswith: ["localization/gnss_conversion"]
+      gnss_map_odom_fusion:
+        type: diagnostic_aggregator/GenericAnalyzer
+        path: gnss_map_odom_fusion
+        startswith: ["localization/gnss_map_odom_fusion", "localization/map_odom_fusion"]

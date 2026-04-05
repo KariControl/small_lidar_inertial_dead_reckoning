@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>pure_lidar_gyro_odometer</name>
+  <version>0.2.0</version>
+  <description>ODOMETRY</description>
+
+  <maintainer email="noreply@example.com">pure_localization</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>rclcpp_components</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>diagnostic_msgs</depend>
+  <depend>tf2</depend>
+  <depend>tf2_ros</depend>
+  <depend>tf2_geometry_msgs</depend>
+
+  <depend>pcl_conversions</depend>
+  <depend>ndt_omp</depend>
+  <depend>small_gicp</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
+
+

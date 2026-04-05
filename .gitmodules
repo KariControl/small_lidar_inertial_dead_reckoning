@@ -1,0 +1,6 @@
+[submodule "src/small_gicp"]
+	path = src/small_gicp
+	url = https://github.com/KariControl/small_gicp.git
+[submodule "src/ndt_omp"]
+	path = src/ndt_omp
+	url = https://github.com/KariControl/ndt_omp.git

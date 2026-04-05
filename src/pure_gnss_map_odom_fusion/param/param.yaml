@@ -1,0 +1,61 @@
+/**:
+  ros__parameters:
+    map_frame: map
+    odom_frame: odom
+    base_frame: base_link
+
+    # Relative odometry input from pure_lidar_gyro_odometer
+    odom_topic: /localization/gyro_lidar_odom
+
+    # Dedicated GNSS fusion input from pure_gnss_conversion
+    # has_odom=true では map -> base_link の gnss_odometry を内包し、
+    # has_odom=false では GNSS 品質情報のみを受け取ります。
+    gnss_input_topic: /localization/gnss_fusion_input
+
+    use_gnss_status: true
+    gnss_status_timeout_sec: 3.0
+    gnss_fix_min_status: 0
+    gnss_init_require_fix: true
+
+    # Optional legacy absolute pose input (PoseWithCovarianceStamped).
+    # Leave empty to disable. Manual /initialpose is still supported.
+    legacy_anchor_topic: ""
+    initialpose_topic: /initialpose
+
+    out_pose_topic: /localization/ekf_pose
+    out_odom_topic: /localization/ekf_odom
+
+    publish_tf: true
+    publish_rate_hz: 50.0
+    heartbeat_hz: 2.0
+
+    odom_buffer_sec: 10.0
+    odom_timeout_sec: 0.05
+    odom_max_extrapolate_sec: 0.5
+
+    # Base covariance and time drift of the absolute anchor estimate.
+    anchor_cov_xy_default: 0.25
+    anchor_cov_yaw_default: 0.04
+    cov_xy_drift_per_sec: 0.20
+    cov_yaw_drift_per_sec: 0.02
+    no_fix_cov_drift_scale: 3.0
+
+    # Complementary fusion gains for GNSS updates.
+    gnss_base_alpha_xy: 0.35
+    gnss_base_alpha_yaw: 0.20
+    gnss_min_alpha_xy: 0.02
+    gnss_min_alpha_yaw: 0.01
+
+    # When GNSS status is not FIX, reduce the blend ratio.
+    gnss_no_fix_ratio_xy: 0.15
+    gnss_no_fix_ratio_yaw: 0.00
+
+    # Covariance-to-gain scaling references.
+    gnss_cov_ref_xy: 0.50
+    gnss_cov_ref_yaw: 0.10
+    gnss_max_cov_xy: 100.0
+    gnss_max_cov_yaw: 10.0
+
+    # Large innovation rejection / down-weighting.
+    gnss_position_jump_reject_m: 20.0
+    gnss_yaw_jump_reject_rad: 1.57

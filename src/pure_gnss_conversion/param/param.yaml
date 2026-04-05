@@ -1,0 +1,76 @@
+/**:
+  ros__parameters:
+    # p0 と gnss0 でローカル原点を決めます。
+    # p0:   [map_x, map_y, map_z]
+    # gnss0:[lat_deg, lon_deg, alt_m]
+    p0: [0.0, 0.0, 0.0]
+    gnss0: [35.681236, 139.767125, 0.0]
+
+    # GRS80 / JGD 系の既定値
+    a: 6378137.0
+    F: 298.257222
+    m0: 0.9999
+
+    # 既存パッケージ互換のオフセット
+    min_x: 0.0
+    min_y: 0.0
+    subtract_min_offset: true
+
+    # 出力フレーム
+    # gnss_odometry / global_pose は常に map -> base_link 系の pose を出します。
+    frame_id: map
+    child_frame_id: base_link
+
+    # GNSS アンテナ frame を明示します。
+    # static TF として base_link -> gnss_antenna を publish してください。
+    antenna_frame_id: gnss_antenna
+
+    # true のとき GNSS アンテナ取付け位置オフセットを TF から補正します。
+    # 補正式: T_map_base = T_map_antenna * T_antenna_base
+    enable_lever_arm_correction: true
+
+    # Doppler heading が無効で前サンプルもまだ無い起動直後に使う初期 heading[deg]
+    initial_heading_deg: 0.0
+
+    # Doppler heading が無効な間は IMU の yaw rate を積分して fallback heading を更新します。
+    # 既定では pure_lidar_gyro_odometer の /localization/imu_corrected を使います。
+    imu_topic: /localization/imu_corrected
+    use_imu_yaw_rate_fallback: true
+    imu_buffer_retention_sec: 3.0
+    imu_max_buffer_size: 500
+    imu_yaw_rate_timeout_sec: 0.2
+    imu_yaw_rate_variance_fallback: 0.25
+
+    # heading が無効なときも出力を止めず、fallback heading で base_link へ変換します。
+    # true: レバーアーム由来の追加 XY 共分散を加算
+    # false: より保守的に XY 共分散を大きく設定
+    allow_uncorrected_output_without_heading: true
+    uncorrected_xy_variance_scale: 1.0
+
+    # GNSS antenna TF が取れないときに追加する XY 共分散[m^2]
+    tf_missing_extra_cov_xy: 25.0
+
+    # Doppler から heading を更新する条件
+    doppler_min_speed_mps: 1.33
+    doppler_speed_sigma_th: 10.0
+    heading_sigma_deg_th: 10.0
+
+    # fix と fix_velocity の時刻同期設定
+    # 目安として GNSS 更新周期の 1/2 より小さめにしてください。
+    # 10Hz なら 0.03〜0.04[s] 程度が無難です。
+    sync_tolerance_sec: 0.03
+    buffer_retention_sec: 1.0
+    max_buffer_size: 100
+
+    # true のとき nav_msgs/Odometry も publish
+    publish_gnss_odometry: true
+
+    # true のとき fusion 専用の GNSS 入力も publish します。
+    # has_odom=false では品質情報のみ、has_odom=true では同期済み gnss_odometry を内包します。
+    publish_gnss_fusion_input: true
+
+    # Diagnostics / heartbeat
+    publish_diagnostics: true
+    heartbeat_hz: 2.0
+    input_stale_timeout_sec: 2.0
+    sync_stale_timeout_sec: 2.0
