@@ -12,6 +12,7 @@
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_msgs/msg/bool.hpp>
+#include <std_msgs/msg/string.hpp>
 
 #include <rclcpp/rclcpp.hpp>
 
@@ -47,6 +48,23 @@ private:
     double v_raw{0.0};
   };
 
+  struct DegeneracyInfo
+  {
+    bool has_hessian{false};
+    bool degenerate{false};
+    bool wheel_prior_available{false};
+    bool wheel_assisted{false};
+    int weak_direction_count{0};
+    double score{0.0};
+    double eig_min{0.0};
+    double eig_mid{0.0};
+    double eig_max{0.0};
+    double wheel_distance{0.0};
+    double prior_dx{0.0};
+    double prior_dy{0.0};
+    double prior_dyaw{0.0};
+  };
+
   struct LidarOdomSample
   {
     rclcpp::Time stamp;
@@ -57,6 +75,10 @@ private:
     double dy{0.0};
     double dyaw{0.0};
     double v{0.0};
+    double raw_dx{0.0};
+    double raw_dy{0.0};
+    double raw_dyaw{0.0};
+    DegeneracyInfo degeneracy;
   };
 
   struct ScanFactor
@@ -70,6 +92,7 @@ private:
     double fitness{0.0};
     bool converged{false};
     bool stationary{false};
+    bool wheel_assisted{false};
   };
 
   static double normalizeYaw(double a);
@@ -84,9 +107,13 @@ private:
   void onPublishTimer();
   void updateStopState(const rclcpp::Time & nowt);
   void publishDiagnostics(const rclcpp::Time & stamp, const std::string & level, const std::string & msg);
+  void publishDegeneracyDebug(
+    const rclcpp::Time & stamp, const LidarOdomSample & sample, const std::string & guess_mode_used,
+    const std::string & next_guess_mode);
 
   bool computeAccVariance(const rclcpp::Time & nowt, double window_sec, double & out_var) const;
   bool computeImuDeltaYaw(const rclcpp::Time & t0, const rclcpp::Time & t1, double & out_dyaw) const;
+  bool computeWheelDistance(const rclcpp::Time & t0, const rclcpp::Time & t1, double & out_dist) const;
   double scanYawWeight(double fitness, bool converged) const;
   bool updateMiniSmootherLocked(const ScanFactor & factor);
 
@@ -142,6 +169,16 @@ private:
   double wheel_scale_min_{0.5};
   double wheel_scale_max_{2.0};
 
+  // Degeneracy-aware wheel-speed assist (small_gicp Hessian based)
+  bool wheel_degeneracy_enable_{true};
+  double wheel_degeneracy_yaw_metric_m_{2.0};
+  double wheel_degeneracy_rel_eigenvalue_thr_{0.10};
+  double wheel_degeneracy_abs_eigenvalue_thr_{0.0};
+  double wheel_degeneracy_min_wheel_dist_m_{0.05};
+  double wheel_degeneracy_prior_blend_{1.0};
+  bool wheel_degeneracy_debug_pub_enable_{false};
+  std::string wheel_degeneracy_debug_topic_{"/localization/lidar_degeneracy_debug"};
+
   // LiDAR odometry
   bool lidar_odom_enable_{true};
   std::string lidar_backend_{"SMALL_GICP"};
@@ -189,6 +226,7 @@ private:
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pub_stopped_;
   rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr pub_imu_corrected_;
   rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr pub_diag_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pub_degeneracy_debug_;
 
   rclcpp::TimerBase::SharedPtr timer_;
 
@@ -210,6 +248,7 @@ private:
   Eigen::Matrix3d R_base_imu_{Eigen::Matrix3d::Identity()};
 
   // Wheel speed
+  std::deque<WheelSample> wheel_buf_;
   WheelSample last_wheel_;
   bool has_wheel_{false};
   double v_acc_est_{0.0};
@@ -247,6 +286,9 @@ private:
   bool has_odom_pose_{false};
   double last_lidar_yaw_imu_{0.0};
   bool has_last_lidar_yaw_imu_{false};
+  bool next_icp_force_full_guess_{false};
+  std::string last_icp_guess_mode_{"identity"};
+  std::string next_icp_guess_mode_{"yaw_only"};
 
   // Fixed-lag smoothing state for local odometry
   std::deque<ScanFactor> scan_factor_buf_;

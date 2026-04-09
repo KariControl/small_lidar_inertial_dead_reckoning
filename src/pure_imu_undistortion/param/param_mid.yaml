@@ -2,7 +2,8 @@ imu_undistorter:
   ros__parameters:
     base_frame: "base_link"
     imu_frame: "imu"     
-    scan_frame: "lidar/0"    # 空ならPointCloud2.header.frame_id
+    scan_frame: "livox_frame"    # 空ならPointCloud2.header.frame_id
+    # scan_frame: "lidar/0"    # 空ならPointCloud2.header.frame_id
 
     points_in_topic: "/converted_points"
     points_out_topic: "/localization/points_undistorted"
@@ -18,9 +19,9 @@ imu_undistorter:
     reference_time: "start"          # "start" or "end"
 
     # バッファ
-    imu_buffer_sec: 2.0
+    imu_buffer_sec: 3.0
     twist_buffer_sec: 2.0
-    max_imu_gap_sec: 0.02
+    max_imu_gap_sec: 0.03
     max_time_offset_sec: 0.2
 
     # 並進補正（オプション）
