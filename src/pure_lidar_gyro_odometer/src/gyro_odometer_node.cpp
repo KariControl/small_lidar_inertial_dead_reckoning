@@ -51,6 +51,36 @@ std::string formatDouble(double v, int precision = 6)
   return oss.str();
 }
 
+constexpr uint8_t kLidarPoseModeNormal = 0;
+constexpr uint8_t kLidarPoseModeCritical = 1;
+constexpr uint8_t kLidarPoseModeScanReject = 2;
+constexpr int kCriticalKeepSpeedMismatchStreak = 3;
+
+std::string lidarPoseModeToString(uint8_t mode)
+{
+  switch (mode) {
+    case kLidarPoseModeCritical:
+      return "CRITICAL";
+    case kLidarPoseModeScanReject:
+      return "SCAN_REJECT";
+    case kLidarPoseModeNormal:
+    default:
+      return "NORMAL";
+  }
+}
+
+double clamp01(double v)
+{
+  return std::max(0.0, std::min(1.0, v));
+}
+
+double wrapYaw(double a)
+{
+  while (a > M_PI) a -= 2.0 * M_PI;
+  while (a < -M_PI) a += 2.0 * M_PI;
+  return a;
+}
+
 using Matrix6d = Eigen::Matrix<double, 6, 6>;
 using Matrix3d = Eigen::Matrix3d;
 using Vector3d = Eigen::Vector3d;
@@ -188,12 +218,61 @@ Eigen::Vector3d arcMotionPrior(double distance, double dyaw)
   return Eigen::Vector3d(dx, dy, dyaw);
 }
 
+Eigen::Matrix4f se2DeltaToScanGuess(
+  const Eigen::Vector3d & delta_base,
+  const Eigen::Matrix4f & T_base_scan,
+  const Eigen::Matrix4f & T_scan_base)
+{
+  Eigen::Matrix4f T_prev_curr_base = Eigen::Matrix4f::Identity();
+  T_prev_curr_base(0, 3) = static_cast<float>(delta_base.x());
+  T_prev_curr_base(1, 3) = static_cast<float>(delta_base.y());
+  T_prev_curr_base.block<3, 3>(0, 0) =
+    Eigen::AngleAxisf(static_cast<float>(delta_base.z()), Eigen::Vector3f::UnitZ()).toRotationMatrix();
+
+  Eigen::Matrix4f T_prev_curr_scan = T_scan_base * T_prev_curr_base * T_base_scan;
+  if (!T_prev_curr_scan.allFinite()) {
+    return Eigen::Matrix4f::Identity();
+  }
+  return T_prev_curr_scan;
+}
+
 Eigen::Vector3d fuseWeakDirections(
   const Eigen::Vector3d & scan_delta,
   const Eigen::Vector3d & prior_delta,
   const Matrix3d & weak_projector_param)
 {
   return scan_delta + weak_projector_param * (prior_delta - scan_delta);
+}
+
+double se2MetricNorm(const Eigen::Vector3d & delta, double yaw_metric_m)
+{
+  const double L = std::max(1e-3, yaw_metric_m);
+  return std::sqrt(
+    delta.x() * delta.x() + delta.y() * delta.y() +
+    (L * delta.z()) * (L * delta.z()));
+}
+
+Eigen::Vector3d se2LocalDelta(
+  double prev_x, double prev_y, double prev_yaw,
+  double curr_x, double curr_y, double curr_yaw)
+{
+  const double dx_world = curr_x - prev_x;
+  const double dy_world = curr_y - prev_y;
+  const double c = std::cos(prev_yaw);
+  const double s = std::sin(prev_yaw);
+  const double dx_local = c * dx_world + s * dy_world;
+  const double dy_local = -s * dx_world + c * dy_world;
+  const double dyaw = wrapYaw(curr_yaw - prev_yaw);
+  return Eigen::Vector3d(dx_local, dy_local, dyaw);
+}
+
+void integrateSe2Delta(double & x, double & y, double & yaw, const Eigen::Vector3d & delta_local)
+{
+  const double c = std::cos(yaw);
+  const double s = std::sin(yaw);
+  x += c * delta_local.x() - s * delta_local.y();
+  y += s * delta_local.x() + c * delta_local.y();
+  yaw = wrapYaw(yaw + delta_local.z());
 }
 
 }  // namespace
@@ -233,8 +312,8 @@ GyroOdometerNode::GyroOdometerNode(const rclcpp::NodeOptions & options)
   reference_pose_topic_ = declare_parameter<std::string>("reference_pose_topic", "");
   points_topic_ = declare_parameter<std::string>("points_topic", "/localization/points_undistorted");
 
-  out_twist_topic_ = declare_parameter<std::string>("out_twist_topic", "/localization/twist");
   out_odom_topic_ = declare_parameter<std::string>("out_odom_topic", "/localization/gyro_lidar_odom");
+  out_filtered_odom_topic_ = declare_parameter<std::string>("out_filtered_odom_topic", "/localization/gyro_lidar_odom_filtered");
   out_stopped_topic_ = declare_parameter<std::string>("out_stopped_topic", "/localization/is_stopped");
   out_imu_topic_ = declare_parameter<std::string>("out_imu_topic", "/localization/imu_corrected");
 
@@ -244,6 +323,20 @@ GyroOdometerNode::GyroOdometerNode(const rclcpp::NodeOptions & options)
     declare_parameter<bool>("imu_corrected.transform_orientation", false);
 
   publish_rate_hz_ = declare_parameter<double>("publish_rate_hz", 50.0);
+  out_filtered_odom_enable_ =
+    declare_parameter<bool>("out_filtered_odom.enable", true);
+  filtered_odom_zero_when_stopped_ =
+    declare_parameter<bool>("out_filtered_odom.zero_when_stopped", true);
+  filtered_odom_lowpass_alpha_ =
+    declare_parameter<double>("out_filtered_odom.lowpass_alpha", 0.85);
+  filtered_odom_linear_rate_limit_mps2_ =
+    declare_parameter<double>("out_filtered_odom.linear_rate_limit_mps2", 4.0);
+  filtered_odom_lateral_rate_limit_mps2_ =
+    declare_parameter<double>("out_filtered_odom.lateral_rate_limit_mps2", 2.0);
+  filtered_odom_yaw_rate_limit_radps2_ =
+    declare_parameter<double>("out_filtered_odom.yaw_rate_limit_radps2", 1.5);
+  filtered_odom_reset_gap_sec_ =
+    declare_parameter<double>("out_filtered_odom.reset_gap_sec", 1.0);
 
   // Stop detection
   stop_enable_ = declare_parameter<bool>("stop.enable", true);
@@ -287,9 +380,57 @@ GyroOdometerNode::GyroOdometerNode(const rclcpp::NodeOptions & options)
   wheel_degeneracy_min_wheel_dist_m_ =
     declare_parameter<double>("wheel_speed.degeneracy.min_wheel_dist_m", 0.05);
   wheel_degeneracy_prior_blend_ = declare_parameter<double>("wheel_speed.degeneracy.prior_blend", 1.0);
+  wheel_degeneracy_full_guess_use_current_prior_ =
+    declare_parameter<bool>("wheel_speed.degeneracy.full_guess_use_current_prior", true);
+  wheel_degeneracy_latch_hold_sec_ =
+    declare_parameter<double>("wheel_speed.degeneracy.latch_hold_sec", 0.5);
+  wheel_degeneracy_latch_off_streak_thr_ =
+    declare_parameter<int>("wheel_speed.degeneracy.latch_off_streak_thr", 6);
+  wheel_degeneracy_score_thr_ = declare_parameter<double>("wheel_speed.degeneracy.score_thr", 0.25);
+  wheel_degeneracy_prior_conflict_trans_thr_m_ =
+    declare_parameter<double>("wheel_speed.degeneracy.prior_conflict.trans_thr_m", 0.05);
+  wheel_degeneracy_prior_conflict_yaw_thr_rad_ =
+    declare_parameter<double>("wheel_speed.degeneracy.prior_conflict.yaw_thr_rad", 0.01);
+  wheel_degeneracy_prior_conflict_metric_thr_m_ =
+    declare_parameter<double>("wheel_speed.degeneracy.prior_conflict.metric_thr_m", 0.08);
+  wheel_degeneracy_bad_fit_fitness_thr_ =
+    declare_parameter<double>("wheel_speed.degeneracy.bad_fit_fitness_thr", 1.5);
+  wheel_degeneracy_scan_wheel_speed_diff_thr_mps_ =
+    declare_parameter<double>("wheel_speed.degeneracy.scan_wheel_speed_diff_thr_mps", 1.0);
+  wheel_degeneracy_stationary_trans_thr_m_ =
+    declare_parameter<double>("wheel_speed.degeneracy.stationary.trans_thr_m", 0.03);
+  wheel_degeneracy_stationary_yaw_thr_rad_ =
+    declare_parameter<double>("wheel_speed.degeneracy.stationary.yaw_thr_rad", 0.01);
   wheel_degeneracy_debug_pub_enable_ = declare_parameter<bool>("wheel_speed.degeneracy.debug_pub.enable", false);
   wheel_degeneracy_debug_topic_ = declare_parameter<std::string>(
     "wheel_speed.degeneracy.debug_pub.topic", "/localization/lidar_degeneracy_debug");
+  out_degeneracy_enable_ = declare_parameter<bool>("out_degeneracy.enable", true);
+  out_degeneracy_topic_ =
+    declare_parameter<std::string>("out_degeneracy_topic", "/localization/lidar_degenerate");
+  out_pose_mode_enable_ = declare_parameter<bool>("out_pose_mode.enable", true);
+  out_pose_mode_topic_ =
+    declare_parameter<std::string>("out_pose_mode_topic", "/localization/lidar_pose_mode");
+
+  odom_cov_base_xy_step_ = declare_parameter<double>("odom_covariance.base_xy_step", odom_cov_base_xy_step_);
+  odom_cov_base_yaw_step_ = declare_parameter<double>("odom_covariance.base_yaw_step", odom_cov_base_yaw_step_);
+  odom_cov_xy_per_meter_ = declare_parameter<double>("odom_covariance.xy_per_meter", odom_cov_xy_per_meter_);
+  odom_cov_yaw_per_rad_ = declare_parameter<double>("odom_covariance.yaw_per_rad", odom_cov_yaw_per_rad_);
+  odom_cov_fitness_xy_scale_ =
+    declare_parameter<double>("odom_covariance.fitness_xy_scale", odom_cov_fitness_xy_scale_);
+  odom_cov_fitness_yaw_scale_ =
+    declare_parameter<double>("odom_covariance.fitness_yaw_scale", odom_cov_fitness_yaw_scale_);
+  odom_cov_degenerate_scale_ =
+    declare_parameter<double>("odom_covariance.degenerate_scale", odom_cov_degenerate_scale_);
+  odom_cov_wheel_assist_scale_ =
+    declare_parameter<double>("odom_covariance.wheel_assist_scale", odom_cov_wheel_assist_scale_);
+  odom_cov_invalid_xy_step_ =
+    declare_parameter<double>("odom_covariance.invalid_xy_step", odom_cov_invalid_xy_step_);
+  odom_cov_invalid_yaw_step_ =
+    declare_parameter<double>("odom_covariance.invalid_yaw_step", odom_cov_invalid_yaw_step_);
+  odom_cov_deadreckon_xy_per_sec_ = declare_parameter<double>(
+    "odom_covariance.deadreckon_xy_per_sec", odom_cov_deadreckon_xy_per_sec_);
+  odom_cov_deadreckon_yaw_per_sec_ = declare_parameter<double>(
+    "odom_covariance.deadreckon_yaw_per_sec", odom_cov_deadreckon_yaw_per_sec_);
 
   // LiDAR odometry (scan-to-scan, backend selectable)
   lidar_odom_enable_ = declare_parameter<bool>("lidar_odom.enable", true);
@@ -338,6 +479,11 @@ GyroOdometerNode::GyroOdometerNode(const rclcpp::NodeOptions & options)
         lidar_backend_.c_str());
     }
   }
+  if (wheel_degeneracy_enable_ && !use_wheel_speed_) {
+    RCLCPP_INFO(
+      get_logger(),
+      "wheel_speed.degeneracy is enabled but wheel_speed.use=false. Degeneracy judgement/assist will stay disabled until wheel speed is enabled.");
+  }
   if (wheel_degeneracy_debug_pub_enable_ && wheel_degeneracy_debug_topic_.empty()) {
     RCLCPP_WARN(
       get_logger(),
@@ -346,9 +492,19 @@ GyroOdometerNode::GyroOdometerNode(const rclcpp::NodeOptions & options)
   }
 
   // Publishers
-  pub_twist_ = create_publisher<geometry_msgs::msg::TwistStamped>(out_twist_topic_, 10);
-  pub_odom_ = create_publisher<nav_msgs::msg::Odometry>(out_odom_topic_, 10);
+  pub_odom_raw_ = create_publisher<nav_msgs::msg::Odometry>(out_odom_topic_, 10);
+  if (out_filtered_odom_enable_ && !out_filtered_odom_topic_.empty() && out_filtered_odom_topic_ != out_odom_topic_) {
+    pub_odom_filtered_ = create_publisher<nav_msgs::msg::Odometry>(out_filtered_odom_topic_, 10);
+  } else if (out_filtered_odom_enable_ && !out_filtered_odom_topic_.empty() && out_filtered_odom_topic_ == out_odom_topic_) {
+    RCLCPP_WARN(get_logger(), "out_filtered_odom_topic matches out_odom_topic; filtered odom publisher is disabled.");
+  }
   pub_stopped_ = create_publisher<std_msgs::msg::Bool>(out_stopped_topic_, 10);
+  if (out_degeneracy_enable_ && !out_degeneracy_topic_.empty()) {
+    pub_degenerate_ = create_publisher<std_msgs::msg::Bool>(out_degeneracy_topic_, 10);
+  }
+  if (out_pose_mode_enable_ && !out_pose_mode_topic_.empty()) {
+    pub_pose_mode_ = create_publisher<std_msgs::msg::UInt8>(out_pose_mode_topic_, 10);
+  }
   if (imu_corrected_enable_) {
     pub_imu_corrected_ = create_publisher<sensor_msgs::msg::Imu>(out_imu_topic_, rclcpp::SensorDataQoS());
   }
@@ -1226,6 +1382,11 @@ void GyroOdometerNode::onPoints(const sensor_msgs::msg::PointCloud2::SharedPtr m
   Eigen::Matrix4f guess;
   rclcpp::Time prev_lidar_stamp = stamp;
   std::string guess_mode_used{"full"};
+  bool force_full_guess = false;
+  bool prev_interval_degenerate = false;
+  bool prev_interval_scan_rejected = false;
+  bool has_last_lidar_yaw_imu_for_guess = false;
+  double last_lidar_yaw_imu_for_guess = 0.0;
   {
     std::lock_guard<std::mutex> lk(mtx_);
     if (!has_prev_cloud_ || !prev_cloud_ || prev_cloud_->empty()) {
@@ -1233,10 +1394,17 @@ void GyroOdometerNode::onPoints(const sensor_msgs::msg::PointCloud2::SharedPtr m
       has_prev_cloud_ = true;
       last_lidar_.stamp = stamp;
       last_lidar_.valid = false;
+      last_lidar_.converged = false;
+      last_lidar_.degeneracy = DegeneracyInfo{};
       last_gicp_guess_ = Eigen::Matrix4f::Identity();
       next_icp_force_full_guess_ = false;
       last_icp_guess_mode_ = "identity";
       next_icp_guess_mode_ = lidar_guess_use_imu_yaw_only_ ? "yaw_only" : "full";
+      degeneracy_state_ = false;
+      has_critical_latch_until_ = false;
+      critical_clear_streak_ = 0;
+      weak_observation_streak_ = 0;
+      speed_mismatch_streak_ = 0;
       if (!has_odom_pose_) {
         odom_yaw_ = yaw_imu_;
         has_odom_pose_ = true;
@@ -1248,20 +1416,48 @@ void GyroOdometerNode::onPoints(const sensor_msgs::msg::PointCloud2::SharedPtr m
     prev = prev_cloud_;
     guess = last_gicp_guess_;
     prev_lidar_stamp = last_lidar_.stamp;
-    const bool force_full_guess = next_icp_force_full_guess_;
-    if (lidar_guess_use_imu_yaw_only_ && has_last_lidar_yaw_imu_ && !force_full_guess) {
-      const double imu_delta_yaw = normalizeYaw(yaw_imu_ - last_lidar_yaw_imu_);
-      guess = Eigen::Matrix4f::Identity();
-      guess.block<3, 3>(0, 0) =
-        Eigen::AngleAxisf(static_cast<float>(imu_delta_yaw), Eigen::Vector3f::UnitZ()).toRotationMatrix();
-      guess_mode_used = "yaw_only";
-    } else if (force_full_guess) {
-      guess_mode_used = "full_due_to_previous_degeneracy";
-    } else if (lidar_guess_use_imu_yaw_only_ && !has_last_lidar_yaw_imu_) {
-      guess_mode_used = "full_no_imu_delta";
+    force_full_guess = next_icp_force_full_guess_;
+    prev_interval_degenerate = last_lidar_.degeneracy.degenerate;
+    prev_interval_scan_rejected = last_lidar_.degeneracy.scan_rejected;
+    has_last_lidar_yaw_imu_for_guess = has_last_lidar_yaw_imu_;
+    last_lidar_yaw_imu_for_guess = last_lidar_yaw_imu_;
+  }
+
+  double imu_delta_yaw_meas = 0.0;
+  bool has_imu_delta_yaw = computeImuDeltaYaw(prev_lidar_stamp, stamp, imu_delta_yaw_meas);
+  if (!has_imu_delta_yaw && has_last_lidar_yaw_imu_for_guess) {
+    imu_delta_yaw_meas = normalizeYaw(yaw_imu_ - last_lidar_yaw_imu_for_guess);
+    has_imu_delta_yaw = true;
+  }
+
+  double wheel_distance_guess = 0.0;
+  const bool has_wheel_distance = use_wheel_speed_ && computeWheelDistance(prev_lidar_stamp, stamp, wheel_distance_guess);
+  const bool has_current_prior_guess = has_imu_delta_yaw && has_wheel_distance;
+  const Eigen::Vector3d delta_prior_guess =
+    has_current_prior_guess ? arcMotionPrior(wheel_distance_guess, imu_delta_yaw_meas) : Eigen::Vector3d::Zero();
+
+  if (lidar_guess_use_imu_yaw_only_ && has_last_lidar_yaw_imu_for_guess && !force_full_guess) {
+    guess = Eigen::Matrix4f::Identity();
+    guess.block<3, 3>(0, 0) =
+      Eigen::AngleAxisf(static_cast<float>(imu_delta_yaw_meas), Eigen::Vector3f::UnitZ()).toRotationMatrix();
+    guess_mode_used = "yaw_only";
+  } else if (force_full_guess && wheel_degeneracy_full_guess_use_current_prior_ && has_current_prior_guess) {
+    guess = se2DeltaToScanGuess(delta_prior_guess, T_base_scan, T_scan_base);
+    if (prev_interval_degenerate || prev_interval_scan_rejected) {
+      guess_mode_used = "full_wheel_imu_prior_due_to_previous_critical_or_reject";
     } else {
-      guess_mode_used = "full";
+      guess_mode_used = "full_wheel_imu_prior";
     }
+  } else if (force_full_guess) {
+    if (prev_interval_degenerate || prev_interval_scan_rejected) {
+      guess_mode_used = "full_due_to_previous_critical_or_reject";
+    } else {
+      guess_mode_used = "full_due_to_previous_request";
+    }
+  } else if (lidar_guess_use_imu_yaw_only_ && !has_last_lidar_yaw_imu_for_guess) {
+    guess_mode_used = "full_no_imu_delta";
+  } else {
+    guess_mode_used = "full";
   }
 
   if (!prev || prev->size() < 50 || cloud->size() < 50) {
@@ -1270,9 +1466,16 @@ void GyroOdometerNode::onPoints(const sensor_msgs::msg::PointCloud2::SharedPtr m
     has_prev_cloud_ = true;
     last_lidar_.stamp = stamp;
     last_lidar_.valid = false;
+    last_lidar_.converged = false;
+    last_lidar_.degeneracy = DegeneracyInfo{};
     next_icp_force_full_guess_ = false;
     last_icp_guess_mode_ = "insufficient_points";
     next_icp_guess_mode_ = lidar_guess_use_imu_yaw_only_ ? "yaw_only" : "full";
+    degeneracy_state_ = false;
+    has_critical_latch_until_ = false;
+    critical_clear_streak_ = 0;
+    weak_observation_streak_ = 0;
+    speed_mismatch_streak_ = 0;
     if (!has_odom_pose_) {
       odom_yaw_ = yaw_imu_;
       has_odom_pose_ = true;
@@ -1346,18 +1549,47 @@ void GyroOdometerNode::onPoints(const sensor_msgs::msg::PointCloud2::SharedPtr m
   }
   if (!std::isfinite(dt) || dt <= 1e-6) dt = 0.0;
 
-  double imu_delta_yaw_meas = 0.0;
-  bool has_imu_delta_yaw = computeImuDeltaYaw(prev_lidar_stamp, stamp, imu_delta_yaw_meas);
-  if (!has_imu_delta_yaw && has_last_lidar_yaw_imu_) {
-    imu_delta_yaw_meas = normalizeYaw(yaw_imu_ - last_lidar_yaw_imu_);
-    has_imu_delta_yaw = true;
+  bool stationary_now = false;
+  {
+    std::lock_guard<std::mutex> lk(mtx_);
+    updateStopState(stamp);
+    stationary_now = is_stopped_;
   }
 
   DegeneracyInfo degeneracy;
+  degeneracy.has_hessian = has_hessian;
+  degeneracy.stationary_now = stationary_now;
   Eigen::Vector3d delta_scan(raw_dx, raw_dy, raw_dyaw);
   Eigen::Vector3d delta_used = delta_scan;
+  Eigen::Vector3d delta_prior = Eigen::Vector3d::Zero();
+  Matrix3d weak_projector_eval = Matrix3d::Zero();
+  bool detection_enabled_for_frame = false;
 
-  if (wheel_degeneracy_enable_ && has_hessian) {
+  const bool detection_pipeline_enabled = wheel_degeneracy_enable_ && use_wheel_speed_;
+  const bool wheel_prior_available = use_wheel_speed_ && has_imu_delta_yaw && has_wheel_distance;
+  if (wheel_prior_available) {
+    degeneracy.wheel_prior_available = true;
+    degeneracy.wheel_distance = wheel_distance_guess;
+    delta_prior = arcMotionPrior(wheel_distance_guess, imu_delta_yaw_meas);
+    degeneracy.prior_dx = delta_prior.x();
+    degeneracy.prior_dy = delta_prior.y();
+    degeneracy.prior_dyaw = normalizeYaw(delta_prior.z());
+
+    if (dt > 1e-6) {
+      degeneracy.scan_speed_mps = std::sqrt(raw_dx * raw_dx + raw_dy * raw_dy) / dt;
+      degeneracy.wheel_speed_mps = std::fabs(wheel_distance_guess) / dt;
+      degeneracy.speed_diff_mps = std::fabs(degeneracy.scan_speed_mps - degeneracy.wheel_speed_mps);
+      degeneracy.speed_mismatch =
+        degeneracy.speed_diff_mps > std::max(0.0, wheel_degeneracy_scan_wheel_speed_diff_thr_mps_);
+    }
+  }
+
+  const double bad_fit_fitness_thr =
+    (wheel_degeneracy_bad_fit_fitness_thr_ > 0.0) ? wheel_degeneracy_bad_fit_fitness_thr_ : gicp_fitness_max_;
+  degeneracy.bad_fit = (!converged) || !std::isfinite(fitness) || (fitness > bad_fit_fitness_thr) || (dt <= 0.0);
+  degeneracy.scan_rejected = detection_pipeline_enabled && wheel_prior_available && degeneracy.bad_fit;
+
+  if (wheel_degeneracy_enable_ && has_hessian && wheel_prior_available) {
     const Matrix6d tmp = adjointRotationFirst(T_scan_base.cast<double>()).transpose() * hessian_scan *
                          adjointRotationFirst(T_scan_base.cast<double>());
     const Matrix6d H_base = 0.5 * (tmp + tmp.transpose());
@@ -1365,52 +1597,159 @@ void GyroOdometerNode::onPoints(const sensor_msgs::msg::PointCloud2::SharedPtr m
     Matrix3d info_se2 = Matrix3d::Zero();
     if (reduceHessianToSe2Info(H_base, info_se2)) {
       degeneracy.has_hessian = true;
+      degeneracy.detection_enabled = true;
+      detection_enabled_for_frame = true;
 
-      Matrix3d weak_projector = Matrix3d::Zero();
       Eigen::Vector3d eigvals_norm = Eigen::Vector3d::Zero();
       int weak_count = 0;
       double score = 0.0;
-      std::tie(weak_projector, eigvals_norm, weak_count, score) = computeWeakProjector(
+      std::tie(weak_projector_eval, eigvals_norm, weak_count, score) = computeWeakProjector(
         info_se2,
         wheel_degeneracy_yaw_metric_m_,
         wheel_degeneracy_rel_eigenvalue_thr_,
         wheel_degeneracy_abs_eigenvalue_thr_,
-        wheel_degeneracy_prior_blend_);
+        1.0);
 
       degeneracy.weak_direction_count = weak_count;
       degeneracy.score = score;
       degeneracy.eig_min = eigvals_norm(0);
       degeneracy.eig_mid = eigvals_norm(1);
       degeneracy.eig_max = eigvals_norm(2);
-      degeneracy.degenerate = (weak_count > 0 && score > 1e-6);
+      degeneracy.assist_candidate = false;
+      degeneracy.weak_observation = (weak_count > 0 && score > wheel_degeneracy_score_thr_);
 
-      if (use_wheel_speed_ && degeneracy.degenerate && has_imu_delta_yaw) {
-        double wheel_distance = 0.0;
-        if (computeWheelDistance(prev_lidar_stamp, stamp, wheel_distance) &&
-            std::fabs(wheel_distance) >= wheel_degeneracy_min_wheel_dist_m_)
-        {
-          degeneracy.wheel_prior_available = true;
-          degeneracy.wheel_distance = wheel_distance;
-          const Eigen::Vector3d delta_prior = arcMotionPrior(wheel_distance, imu_delta_yaw_meas);
-          degeneracy.prior_dx = delta_prior.x();
-          degeneracy.prior_dy = delta_prior.y();
-          degeneracy.prior_dyaw = normalizeYaw(delta_prior.z());
+      if (weak_count > 0) {
+        const Eigen::Vector3d weak_innovation = weak_projector_eval * (delta_scan - delta_prior);
+        degeneracy.prior_conflict_trans = weak_innovation.head<2>().norm();
+        degeneracy.prior_conflict_yaw = std::fabs(weak_innovation.z());
+        degeneracy.prior_conflict_metric = se2MetricNorm(weak_innovation, wheel_degeneracy_yaw_metric_m_);
+        degeneracy.prior_conflict =
+          (degeneracy.prior_conflict_trans > wheel_degeneracy_prior_conflict_trans_thr_m_) ||
+          (degeneracy.prior_conflict_yaw > wheel_degeneracy_prior_conflict_yaw_thr_rad_) ||
+          (degeneracy.prior_conflict_metric > wheel_degeneracy_prior_conflict_metric_thr_m_);
 
-          delta_used = fuseWeakDirections(delta_scan, delta_prior, weak_projector);
-          if (delta_used.allFinite()) {
-            delta_used(2) = normalizeYaw(delta_used(2));
-            degeneracy.wheel_assisted = ((delta_used - delta_scan).norm() > 1e-6);
-          } else {
-            delta_used = delta_scan;
+        const Eigen::Vector3d weak_stationary_delta = weak_projector_eval * delta_scan;
+        degeneracy.stationary_drift_metric =
+          se2MetricNorm(weak_stationary_delta, wheel_degeneracy_yaw_metric_m_);
+        degeneracy.stationary_drift = stationary_now && (
+          weak_stationary_delta.head<2>().norm() > wheel_degeneracy_stationary_trans_thr_m_ ||
+          std::fabs(weak_stationary_delta.z()) > wheel_degeneracy_stationary_yaw_thr_rad_);
+      }
+    }
+  }
+
+  {
+    std::lock_guard<std::mutex> lk(mtx_);
+
+    weak_observation_streak_ = detection_enabled_for_frame && degeneracy.weak_observation ?
+      (weak_observation_streak_ + 1) : 0;
+    speed_mismatch_streak_ =
+      (detection_pipeline_enabled && degeneracy.wheel_prior_available && degeneracy.speed_mismatch) ?
+      (speed_mismatch_streak_ + 1) : 0;
+    const bool persistent_speed_mismatch =
+      speed_mismatch_streak_ >= kCriticalKeepSpeedMismatchStreak;
+
+    if (!detection_pipeline_enabled) {
+      degeneracy_state_ = false;
+      has_critical_latch_until_ = false;
+      critical_clear_streak_ = 0;
+      speed_mismatch_streak_ = 0;
+    } else {
+      const bool critical_candidate =
+        detection_enabled_for_frame &&
+        degeneracy.weak_observation &&
+        (degeneracy.prior_conflict || degeneracy.stationary_drift);
+
+      if (degeneracy.scan_rejected || critical_candidate) {
+        degeneracy_state_ = true;
+        critical_clear_streak_ = 0;
+        const double hold_sec = std::max(0.0, wheel_degeneracy_latch_hold_sec_);
+        critical_latch_until_ = stamp + rclcpp::Duration::from_seconds(hold_sec);
+        has_critical_latch_until_ = hold_sec > 0.0;
+      } else if (degeneracy_state_) {
+        const bool hold_active = has_critical_latch_until_ && (stamp <= critical_latch_until_);
+        const bool keep_evidence =
+          (detection_enabled_for_frame && (degeneracy.prior_conflict || degeneracy.stationary_drift)) ||
+          persistent_speed_mismatch;
+        if (hold_active || keep_evidence) {
+          critical_clear_streak_ = 0;
+        } else {
+          ++critical_clear_streak_;
+          if (critical_clear_streak_ >= std::max(1, wheel_degeneracy_latch_off_streak_thr_)) {
+            degeneracy_state_ = false;
+            has_critical_latch_until_ = false;
+            critical_clear_streak_ = 0;
           }
         }
+      } else {
+        critical_clear_streak_ = 0;
       }
+    }
+
+    degeneracy.speed_mismatch_streak = speed_mismatch_streak_;
+    degeneracy.assist_latched = false;
+    degeneracy.degenerate = degeneracy_state_;
+    if (degeneracy.scan_rejected) {
+      degeneracy.pose_mode = kLidarPoseModeScanReject;
+    } else if (degeneracy.degenerate) {
+      degeneracy.pose_mode = kLidarPoseModeCritical;
+    } else {
+      degeneracy.pose_mode = kLidarPoseModeNormal;
+    }
+    degeneracy.assist_off_streak = 0;
+    degeneracy.weak_observation_streak = weak_observation_streak_;
+    degeneracy.bad_evidence_streak = 0;
+    degeneracy.risk_ema = 0.0;
+    degeneracy.low_obs_hold_remaining_sec = 0.0;
+    degeneracy.critical_hold_remaining_sec =
+      has_critical_latch_until_ ? std::max(0.0, (critical_latch_until_ - stamp).seconds()) : 0.0;
+    degeneracy.critical_clear_streak = critical_clear_streak_;
+  }
+
+  const bool wheel_prior_ready_for_assist =
+    degeneracy.wheel_prior_available &&
+    !stationary_now &&
+    (std::fabs(degeneracy.wheel_distance) >= wheel_degeneracy_min_wheel_dist_m_);
+
+  const bool allow_strong_wheel_assist =
+    wheel_prior_ready_for_assist && degeneracy.degenerate && !degeneracy.scan_rejected;
+
+  const double assist_blend = allow_strong_wheel_assist ? clamp01(wheel_degeneracy_prior_blend_) : 0.0;
+  degeneracy.assist_blend = assist_blend;
+
+  if (degeneracy.scan_rejected && wheel_prior_ready_for_assist) {
+    delta_used = delta_prior;
+    delta_used(2) = normalizeYaw(delta_used(2));
+    degeneracy.wheel_assisted = true;
+    degeneracy.wheel_assisted_weak = false;
+    degeneracy.wheel_assisted_strong = true;
+    degeneracy.assist_blend = 1.0;
+  } else if (assist_blend > 1e-9) {
+    const Matrix3d correction_projector = assist_blend * weak_projector_eval;
+    delta_used = fuseWeakDirections(delta_scan, delta_prior, correction_projector);
+    if (delta_used.allFinite()) {
+      delta_used(2) = normalizeYaw(delta_used(2));
+      degeneracy.wheel_assisted = ((delta_used - delta_scan).norm() > 1e-6);
+      degeneracy.wheel_assisted_strong = degeneracy.wheel_assisted;
+      degeneracy.wheel_assisted_weak = false;
+      if (!degeneracy.wheel_assisted) {
+        degeneracy.assist_blend = 0.0;
+      }
+    } else {
+      delta_used = delta_scan;
+      degeneracy.wheel_assisted = false;
+      degeneracy.wheel_assisted_weak = false;
+      degeneracy.wheel_assisted_strong = false;
+      degeneracy.assist_blend = 0.0;
     }
   }
 
   if (!delta_used.allFinite()) {
     delta_used = delta_scan;
     degeneracy.wheel_assisted = false;
+    degeneracy.wheel_assisted_weak = false;
+    degeneracy.wheel_assisted_strong = false;
+    degeneracy.assist_blend = 0.0;
   }
   delta_used(2) = normalizeYaw(delta_used(2));
 
@@ -1447,9 +1786,13 @@ void GyroOdometerNode::onPoints(const sensor_msgs::msg::PointCloud2::SharedPtr m
     }
   }
 
+  const bool deadreckon_fallback_used = degeneracy.scan_rejected && wheel_prior_ready_for_assist;
+
   LidarOdomSample out;
   out.stamp = stamp;
-  out.valid = (std::isfinite(fitness) && (fitness <= gicp_fitness_max_) && dt > 0.0);
+  out.valid =
+    ((std::isfinite(fitness) && (fitness <= gicp_fitness_max_) && dt > 0.0 && !degeneracy.scan_rejected) ||
+    deadreckon_fallback_used);
   out.converged = converged;
   out.fitness = fitness;
   out.raw_dx = raw_dx;
@@ -1459,17 +1802,27 @@ void GyroOdometerNode::onPoints(const sensor_msgs::msg::PointCloud2::SharedPtr m
   out.dy = delta_used.y();
   out.dyaw = delta_used.z();
   out.degeneracy = degeneracy;
-  if (out.valid) {
-    out.v = std::sqrt(out.dx * out.dx + out.dy * out.dy + dz * dz) / dt;
-    if (out.degeneracy.wheel_assisted && out.degeneracy.wheel_prior_available) {
+  if (out.valid && dt > 1e-6) {
+    if ((out.degeneracy.degenerate || out.degeneracy.scan_rejected) && out.degeneracy.wheel_prior_available) {
       out.v = std::fabs(out.degeneracy.wheel_distance) / dt;
+    } else {
+      out.v = std::sqrt(out.dx * out.dx + out.dy * out.dy + dz * dz) / dt;
     }
   }
 
-  const bool force_full_guess_next = (out.valid && out.degeneracy.degenerate);
+  const bool force_full_guess_next =
+    out.valid &&
+    !out.degeneracy.stationary_now &&
+    (out.degeneracy.degenerate || out.degeneracy.scan_rejected);
+  out.degeneracy.force_full_guess_next = force_full_guess_next;
   std::string next_guess_mode = "full";
   if (lidar_guess_use_imu_yaw_only_) {
-    next_guess_mode = force_full_guess_next ? "full_due_to_current_degeneracy" : "yaw_only";
+    if (force_full_guess_next) {
+      next_guess_mode = out.degeneracy.scan_rejected ?
+        "full_due_to_current_scan_reject" : "full_due_to_current_degeneracy";
+    } else {
+      next_guess_mode = "yaw_only";
+    }
   }
 
   {
@@ -1482,7 +1835,15 @@ void GyroOdometerNode::onPoints(const sensor_msgs::msg::PointCloud2::SharedPtr m
     updateStopState(stamp);
 
     if (out.valid && lidar_pose_se2_enable_) {
-      if (lidar_smoother_enable_ && has_imu_delta_yaw) {
+      if (out.degeneracy.scan_rejected && out.degeneracy.wheel_prior_available) {
+        const double dyaw_fused = has_imu_delta_yaw ? imu_delta_yaw_meas : out.dyaw;
+        const double yaw_mid = odom_yaw_ + 0.5 * dyaw_fused;
+        const double c = std::cos(yaw_mid);
+        const double s = std::sin(yaw_mid);
+        odom_x_ += c * out.dx - s * out.dy;
+        odom_y_ += s * out.dx + c * out.dy;
+        odom_yaw_ = normalizeYaw(odom_yaw_ + dyaw_fused);
+      } else if (lidar_smoother_enable_ && has_imu_delta_yaw) {
         ScanFactor factor;
         factor.stamp_prev = last_lidar_.stamp;
         factor.stamp_curr = stamp;
@@ -1508,6 +1869,44 @@ void GyroOdometerNode::onPoints(const sensor_msgs::msg::PointCloud2::SharedPtr m
         odom_y_ += s * out.dx + c * out.dy;
         odom_yaw_ = normalizeYaw(odom_yaw_ + dyaw_fused);
       }
+    }
+
+    const double motion_dist = std::sqrt(out.dx * out.dx + out.dy * out.dy);
+    if (out.valid) {
+      double step_xy = odom_cov_base_xy_step_;
+      double step_yaw = odom_cov_base_yaw_step_;
+      step_xy += odom_cov_xy_per_meter_ * motion_dist;
+      step_yaw += odom_cov_yaw_per_rad_ * std::fabs(out.dyaw);
+      if (std::isfinite(out.fitness) && out.fitness > 0.0) {
+        step_xy += odom_cov_fitness_xy_scale_ * out.fitness;
+        step_yaw += odom_cov_fitness_yaw_scale_ * out.fitness;
+      }
+      if (!out.converged) {
+        step_xy *= 2.0;
+        step_yaw *= 2.0;
+      }
+      if (out.degeneracy.weak_observation) {
+        const double weak_scale = 1.0 + clamp01(out.degeneracy.score);
+        step_xy *= weak_scale;
+        step_yaw *= weak_scale;
+      }
+      if (out.degeneracy.wheel_assisted) {
+        step_xy *= std::max(1.0, odom_cov_wheel_assist_scale_);
+        step_yaw *= std::max(1.0, odom_cov_wheel_assist_scale_);
+      }
+      if (out.degeneracy.degenerate) {
+        step_xy *= std::max(1.0, odom_cov_degenerate_scale_);
+        step_yaw *= std::max(1.0, odom_cov_degenerate_scale_);
+      }
+      if (is_stopped_ && !out.degeneracy.stationary_drift) {
+        step_xy *= 0.25;
+        step_yaw *= 0.25;
+      }
+      odom_cov_total_xy_ += std::max(0.0, step_xy);
+      odom_cov_total_yaw_ += std::max(0.0, step_yaw);
+    } else {
+      odom_cov_total_xy_ += std::max(0.0, odom_cov_invalid_xy_step_);
+      odom_cov_total_yaw_ += std::max(0.0, odom_cov_invalid_yaw_step_);
     }
 
     last_lidar_yaw_imu_ = yaw_imu_;
@@ -1646,20 +2045,21 @@ void GyroOdometerNode::onPublishTimer()
 {
   const rclcpp::Time nowt = now();
 
-  geometry_msgs::msg::TwistStamped twist;
-  nav_msgs::msg::Odometry odom;
+  nav_msgs::msg::Odometry odom_raw;
+  nav_msgs::msg::Odometry odom_filtered;
   std_msgs::msg::Bool stopped;
+  std_msgs::msg::Bool degeneracy_flag;
+  std_msgs::msg::UInt8 pose_mode_msg;
 
-  // Snapshot state
   double yaw = 0.0;
   double bg = 0.0;
-  double yaw_rate_out = 0.0;
   bool has_yaw_rate_out = false;
+  double yaw_rate_out = 0.0;
   bool imu_extrinsic_cached = false;
   std::string imu_frame_id;
   bool stopped_now = false;
-  bool has_v_out = false;
-  double v_out = 0.0;
+  bool has_v_pred = false;
+  double v_pred = 0.0;
   double v_raw = 0.0;
   double v_wheel = 0.0;
   double v_lidar = 0.0;
@@ -1669,6 +2069,20 @@ void GyroOdometerNode::onPublishTimer()
   double odom_x = 0.0;
   double odom_y = 0.0;
   double odom_yaw = 0.0;
+  double filtered_x = 0.0;
+  double filtered_y = 0.0;
+  double filtered_yaw = 0.0;
+  bool have_filtered_pose = false;
+  double raw_twist_x = 0.0;
+  double raw_twist_y = 0.0;
+  double raw_twist_yaw = 0.0;
+  bool has_raw_twist = false;
+  double filtered_twist_x = 0.0;
+  double filtered_twist_y = 0.0;
+  double filtered_twist_yaw = 0.0;
+  bool has_filtered_twist = false;
+  double odom_cov_xy_total = 0.0;
+  double odom_cov_yaw_total = 0.0;
   LidarOdomSample lidar = {};
   std::string speed_source{"none"};
   std::string last_icp_guess_mode;
@@ -1691,6 +2105,8 @@ void GyroOdometerNode::onPublishTimer()
     odom_x = odom_x_;
     odom_y = odom_y_;
     odom_yaw = has_odom_pose_ ? odom_yaw_ : yaw_imu_;
+    odom_cov_xy_total = odom_cov_total_xy_;
+    odom_cov_yaw_total = odom_cov_total_yaw_;
 
     has_wheel = (use_wheel_speed_ && has_wheel_);
     if (has_wheel) {
@@ -1712,14 +2128,13 @@ void GyroOdometerNode::onPublishTimer()
         has_lidar = false;
       }
     }
-
-    if (has_lidar) v_lidar = lidar.v;
+    if (has_lidar) {
+      v_lidar = lidar.v;
+    }
 
     bool has_wheel_speed = false;
     if (has_wheel) {
       double v_scaled = v_raw * wheel_speed_scale_;
-
-      // Low-speed correction using acceleration integration (optional)
       if (wheel_low_speed_enable_) {
         if (std::fabs(v_raw) < wheel_low_speed_deadband_mps_ && !stopped_now && has_v_acc_) {
           double ax_abs = 0.0;
@@ -1733,49 +2148,50 @@ void GyroOdometerNode::onPublishTimer()
           }
         }
       }
-
       v_wheel = v_scaled;
       has_wheel_speed = true;
     }
 
-    // In nominal scenes keep the existing LiDAR speed output.
-    // Switch to wheel speed only when the Hessian-based assist is active or when LiDAR is unavailable.
-    if (has_lidar && !(use_wheel_speed_ && has_wheel_speed && lidar.degeneracy.wheel_assisted)) {
-      v_out = v_lidar;
-      has_v_out = true;
+    const bool wheel_speed_override_active =
+      lidar.degeneracy.scan_rejected ||
+      lidar.degeneracy.degenerate ||
+      lidar.degeneracy.wheel_assisted_strong;
+
+    if (has_lidar && !(use_wheel_speed_ && has_wheel_speed && wheel_speed_override_active)) {
+      v_pred = v_lidar;
+      has_v_pred = true;
       speed_source = "lidar";
     } else if (has_wheel_speed) {
-      v_out = v_wheel;
-      has_v_out = true;
+      v_pred = v_wheel;
+      has_v_pred = true;
       speed_source = "wheel";
     } else {
-      v_out = 0.0;
-      has_v_out = false;
+      v_pred = 0.0;
+      has_v_pred = false;
       speed_source = "none";
     }
 
-    // High-rate prediction between LiDAR keyframes using IMU yaw-rate and current speed.
     if (!has_last_integrate_) {
       last_integrate_stamp_ = nowt;
       has_last_integrate_ = true;
     }
+
     double pred_x = odom_x_;
     double pred_y = odom_y_;
     double pred_yaw = has_odom_pose_ ? odom_yaw_ : yaw_imu_;
     const double dt_pred = (nowt - last_integrate_stamp_).seconds();
-    if (std::isfinite(dt_pred) && dt_pred > 0.0 && dt_pred < 1.0 && has_v_out) {
+    if (std::isfinite(dt_pred) && dt_pred > 0.0 && dt_pred < 1.0 && has_v_pred) {
       double imu_delta = 0.0;
       if (has_last_lidar_yaw_imu_) {
         imu_delta = normalizeYaw(yaw_imu_ - last_lidar_yaw_imu_);
       }
       pred_yaw = normalizeYaw((has_odom_pose_ ? odom_yaw_ : yaw_imu_) + imu_delta);
-      pred_x = odom_x_ + std::cos(pred_yaw) * v_out * dt_pred;
-      pred_y = odom_y_ + std::sin(pred_yaw) * v_out * dt_pred;
+      pred_x = odom_x_ + std::cos(pred_yaw) * v_pred * dt_pred;
+      pred_y = odom_y_ + std::sin(pred_yaw) * v_pred * dt_pred;
     }
 
-    // If LiDAR odom is unavailable, propagate the stored state as well.
     const bool use_deadreckon_fallback = (!lidar_odom_enable_) || !has_lidar;
-    if (use_deadreckon_fallback && std::isfinite(dt_pred) && dt_pred > 0.0 && dt_pred < 1.0 && has_v_out) {
+    if (use_deadreckon_fallback && std::isfinite(dt_pred) && dt_pred > 0.0 && dt_pred < 1.0 && has_v_pred) {
       if (!has_odom_pose_) {
         odom_yaw_ = yaw_imu_;
         has_odom_pose_ = true;
@@ -1783,52 +2199,190 @@ void GyroOdometerNode::onPublishTimer()
       odom_x_ = pred_x;
       odom_y_ = pred_y;
       odom_yaw_ = pred_yaw;
+      odom_cov_total_xy_ += std::max(0.0, odom_cov_deadreckon_xy_per_sec_) * dt_pred;
+      odom_cov_total_yaw_ += std::max(0.0, odom_cov_deadreckon_yaw_per_sec_) * dt_pred;
+      odom_cov_xy_total = odom_cov_total_xy_;
+      odom_cov_yaw_total = odom_cov_total_yaw_;
       last_integrate_stamp_ = nowt;
     }
 
     odom_x = pred_x;
     odom_y = pred_y;
     odom_yaw = pred_yaw;
+
+    const double dt_raw_pub = has_raw_publish_pose_ ? (nowt - last_raw_publish_stamp_).seconds() : 0.0;
+    if (has_raw_publish_pose_ && std::isfinite(dt_raw_pub) && dt_raw_pub > 1e-4 && dt_raw_pub < 1.0) {
+      const Eigen::Vector3d delta_raw_pub =
+        se2LocalDelta(last_raw_publish_x_, last_raw_publish_y_, last_raw_publish_yaw_, odom_x, odom_y, odom_yaw);
+      raw_twist_x = delta_raw_pub.x() / dt_raw_pub;
+      raw_twist_y = delta_raw_pub.y() / dt_raw_pub;
+      raw_twist_yaw = delta_raw_pub.z() / dt_raw_pub;
+      has_raw_twist = true;
+    } else {
+      raw_twist_x = 0.0;
+      raw_twist_y = 0.0;
+      raw_twist_yaw = has_yaw_rate_out ? yaw_rate_out : 0.0;
+      has_raw_twist = has_yaw_rate_out;
+    }
+    last_raw_publish_x_ = odom_x;
+    last_raw_publish_y_ = odom_y;
+    last_raw_publish_yaw_ = odom_yaw;
+    last_raw_publish_stamp_ = nowt;
+    has_raw_publish_pose_ = true;
+
+    if (out_filtered_odom_enable_ && !out_filtered_odom_topic_.empty() && out_filtered_odom_topic_ != out_odom_topic_) {
+      const double dt_filtered = has_filtered_publish_state_ ? (nowt - last_filtered_publish_stamp_).seconds() : 0.0;
+      const bool reset_filtered =
+        !has_filtered_publish_state_ ||
+        !std::isfinite(dt_filtered) ||
+        dt_filtered <= 1e-4 ||
+        dt_filtered > std::max(0.1, filtered_odom_reset_gap_sec_);
+
+      if (reset_filtered) {
+        filtered_pub_x_ = odom_x;
+        filtered_pub_y_ = odom_y;
+        filtered_pub_yaw_ = odom_yaw;
+        filtered_pub_dx_ = 0.0;
+        filtered_pub_dy_ = 0.0;
+        filtered_pub_dyaw_ = 0.0;
+        filtered_pub_vx_ = 0.0;
+        filtered_pub_vy_ = 0.0;
+        filtered_pub_yaw_rate_ = 0.0;
+        has_filtered_publish_state_ = true;
+      } else if (filtered_odom_zero_when_stopped_ && stopped_now) {
+        filtered_pub_dx_ = 0.0;
+        filtered_pub_dy_ = 0.0;
+        filtered_pub_dyaw_ = 0.0;
+        filtered_pub_vx_ = 0.0;
+        filtered_pub_vy_ = 0.0;
+        filtered_pub_yaw_rate_ = 0.0;
+      } else {
+        const Eigen::Vector3d delta_to_raw =
+          se2LocalDelta(filtered_pub_x_, filtered_pub_y_, filtered_pub_yaw_, odom_x, odom_y, odom_yaw);
+        const double target_vx = delta_to_raw.x() / dt_filtered;
+        const double target_vy = delta_to_raw.y() / dt_filtered;
+        const double target_w = delta_to_raw.z() / dt_filtered;
+
+        const double alpha = clamp01(filtered_odom_lowpass_alpha_);
+        double cmd_vx = alpha * filtered_pub_vx_ + (1.0 - alpha) * target_vx;
+        double cmd_vy = alpha * filtered_pub_vy_ + (1.0 - alpha) * target_vy;
+        double cmd_w = alpha * filtered_pub_yaw_rate_ + (1.0 - alpha) * target_w;
+
+        const double vx_step = std::max(0.0, filtered_odom_linear_rate_limit_mps2_) * dt_filtered;
+        const double vy_step = std::max(0.0, filtered_odom_lateral_rate_limit_mps2_) * dt_filtered;
+        const double w_step = std::max(0.0, filtered_odom_yaw_rate_limit_radps2_) * dt_filtered;
+
+        cmd_vx = filtered_pub_vx_ + std::max(-vx_step, std::min(vx_step, cmd_vx - filtered_pub_vx_));
+        cmd_vy = filtered_pub_vy_ + std::max(-vy_step, std::min(vy_step, cmd_vy - filtered_pub_vy_));
+        cmd_w = filtered_pub_yaw_rate_ + std::max(-w_step, std::min(w_step, cmd_w - filtered_pub_yaw_rate_));
+
+        filtered_pub_dx_ = cmd_vx * dt_filtered;
+        filtered_pub_dy_ = cmd_vy * dt_filtered;
+        filtered_pub_dyaw_ = cmd_w * dt_filtered;
+        integrateSe2Delta(filtered_pub_x_, filtered_pub_y_, filtered_pub_yaw_,
+          Eigen::Vector3d(filtered_pub_dx_, filtered_pub_dy_, filtered_pub_dyaw_));
+        filtered_pub_vx_ = cmd_vx;
+        filtered_pub_vy_ = cmd_vy;
+        filtered_pub_yaw_rate_ = cmd_w;
+      }
+
+      last_filtered_publish_stamp_ = nowt;
+      filtered_x = filtered_pub_x_;
+      filtered_y = filtered_pub_y_;
+      filtered_yaw = filtered_pub_yaw_;
+      filtered_twist_x = filtered_pub_vx_;
+      filtered_twist_y = filtered_pub_vy_;
+      filtered_twist_yaw = filtered_pub_yaw_rate_;
+      has_filtered_twist = has_filtered_publish_state_;
+      have_filtered_pose = has_filtered_publish_state_;
+    }
   }
 
-  // Publish twist (for EKF speed fusion)
-  twist.header.stamp = nowt;
-  twist.header.frame_id = base_frame_;
-  twist.twist.linear.x = v_out;
-  twist.twist.linear.y = 0.0;
-  twist.twist.linear.z = 0.0;
-  twist.twist.angular.z = has_yaw_rate_out ? yaw_rate_out : 0.0;
-  pub_twist_->publish(twist);
+  auto fillOdom = [&](nav_msgs::msg::Odometry & odom_msg,
+                      double x, double y, double yaw_angle,
+                      double vx, double vy, double wz,
+                      bool has_twist) {
+    odom_msg.header.stamp = nowt;
+    odom_msg.header.frame_id = odom_frame_;
+    odom_msg.child_frame_id = base_frame_;
+    odom_msg.pose.pose.position.x = x;
+    odom_msg.pose.pose.position.y = y;
+    odom_msg.pose.pose.position.z = 0.0;
+    const auto q = quatFromYaw(yaw_angle);
+    odom_msg.pose.pose.orientation.x = q.x();
+    odom_msg.pose.pose.orientation.y = q.y();
+    odom_msg.pose.pose.orientation.z = q.z();
+    odom_msg.pose.pose.orientation.w = q.w();
 
-  // Publish odometry (debug)
-  odom.header = twist.header;
-  odom.header.frame_id = odom_frame_;
-  odom.child_frame_id = base_frame_;
+    std::fill(odom_msg.pose.covariance.begin(), odom_msg.pose.covariance.end(), 0.0);
+    odom_msg.pose.covariance[0] = std::max(0.0, odom_cov_xy_total);
+    odom_msg.pose.covariance[7] = std::max(0.0, odom_cov_xy_total);
+    odom_msg.pose.covariance[14] = 1.0e6;
+    odom_msg.pose.covariance[21] = 1.0e6;
+    odom_msg.pose.covariance[28] = 1.0e6;
+    odom_msg.pose.covariance[35] = std::max(0.0, odom_cov_yaw_total);
 
-  odom.pose.pose.position.x = odom_x;
-  odom.pose.pose.position.y = odom_y;
-  odom.pose.pose.position.z = 0.0;
-  const auto q = quatFromYaw(odom_yaw);
-  odom.pose.pose.orientation.x = q.x();
-  odom.pose.pose.orientation.y = q.y();
-  odom.pose.pose.orientation.z = q.z();
-  odom.pose.pose.orientation.w = q.w();
+    std::fill(odom_msg.twist.covariance.begin(), odom_msg.twist.covariance.end(), 0.0);
+    odom_msg.twist.covariance[0] = has_twist ? std::max(1.0e-4, 0.25 * odom_cov_xy_total) : 1.0e6;
+    odom_msg.twist.covariance[7] = has_twist ? std::max(1.0e-4, 0.25 * odom_cov_xy_total) : 1.0e6;
+    odom_msg.twist.covariance[14] = 1.0e6;
+    odom_msg.twist.covariance[21] = 1.0e6;
+    odom_msg.twist.covariance[28] = 1.0e6;
+    odom_msg.twist.covariance[35] = has_twist ? std::max(1.0e-5, 0.25 * odom_cov_yaw_total) : 1.0e6;
 
-  odom.twist.twist = twist.twist;
-  pub_odom_->publish(odom);
+    odom_msg.twist.twist.linear.x = vx;
+    odom_msg.twist.twist.linear.y = vy;
+    odom_msg.twist.twist.linear.z = 0.0;
+    odom_msg.twist.twist.angular.x = 0.0;
+    odom_msg.twist.twist.angular.y = 0.0;
+    odom_msg.twist.twist.angular.z = wz;
+  };
 
-  // Publish stopped flag
+  fillOdom(odom_raw, odom_x, odom_y, odom_yaw, raw_twist_x, raw_twist_y, raw_twist_yaw, has_raw_twist);
+  pub_odom_raw_->publish(odom_raw);
+
+  if (pub_odom_filtered_ && have_filtered_pose) {
+    fillOdom(
+      odom_filtered, filtered_x, filtered_y, filtered_yaw,
+      filtered_twist_x, filtered_twist_y, filtered_twist_yaw, has_filtered_twist);
+    pub_odom_filtered_->publish(odom_filtered);
+  }
+
   stopped.data = stopped_now;
   pub_stopped_->publish(stopped);
 
-  // Diagnostics (lightweight, at publish rate)
+  if (pub_degenerate_) {
+    degeneracy_flag.data = lidar.degeneracy.degenerate;
+    pub_degenerate_->publish(degeneracy_flag);
+  }
+  if (pub_pose_mode_) {
+    pose_mode_msg.data = lidar.degeneracy.pose_mode;
+    pub_pose_mode_->publish(pose_mode_msg);
+  }
+
   {
     diagnostic_msgs::msg::DiagnosticArray arr;
     arr.header.stamp = nowt;
     diagnostic_msgs::msg::DiagnosticStatus st;
-    st.level = stopped_now ? diagnostic_msgs::msg::DiagnosticStatus::OK : diagnostic_msgs::msg::DiagnosticStatus::OK;
+    st.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
+    if (lidar_odom_enable_ && !has_lidar) {
+      st.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+    }
+    if (lidar.degeneracy.degenerate) {
+      st.level = std::max<uint8_t>(st.level, diagnostic_msgs::msg::DiagnosticStatus::WARN);
+    }
     st.name = "localization/gyro_odometer";
-    st.message = (stopped_now ? "stopped" : "running");
+    if (lidar.degeneracy.scan_rejected) {
+      st.message = stopped_now ? "scan rejected while stationary" : "running with scan rejection fallback";
+    } else if (lidar.degeneracy.degenerate) {
+      st.message = stopped_now ? "critical degeneracy while stationary" : "running with latched critical degeneracy";
+    } else if (stopped_now) {
+      st.message = "stopped";
+    } else if (lidar_odom_enable_ && !has_lidar) {
+      st.message = "running dead-reckoning fallback";
+    } else {
+      st.message = "running";
+    }
     st.hardware_id = "none";
 
     auto add = [&](const std::string & k, const std::string & v) {
@@ -1843,9 +2397,20 @@ void GyroOdometerNode::onPublishTimer()
     add("yaw_imu", std::to_string(yaw));
     add("bg_est", std::to_string(bg));
     add("yaw_rate_out", std::to_string(has_yaw_rate_out ? yaw_rate_out : 0.0));
-    add("v_out", std::to_string(v_out));
-    add("has_v_out", has_v_out ? "true" : "false");
-    add("speed_source", speed_source);
+    add("v_pred", std::to_string(v_pred));
+    add("has_v_pred", has_v_pred ? "true" : "false");
+    add("prediction_speed_source", speed_source);
+    add("raw_twist_x", std::to_string(raw_twist_x));
+    add("raw_twist_y", std::to_string(raw_twist_y));
+    add("raw_twist_yaw", std::to_string(raw_twist_yaw));
+    add("filtered_twist_x", std::to_string(filtered_twist_x));
+    add("filtered_twist_y", std::to_string(filtered_twist_y));
+    add("filtered_twist_yaw", std::to_string(filtered_twist_yaw));
+    add("odom_cov_xy_total", std::to_string(odom_cov_xy_total));
+    add("odom_cov_yaw_total", std::to_string(odom_cov_yaw_total));
+    add("raw_odom_topic", out_odom_topic_);
+    add("filtered_odom_topic", pub_odom_filtered_ ? out_filtered_odom_topic_ : std::string("disabled"));
+    add("lidar_pose_mode_topic", pub_pose_mode_ ? out_pose_mode_topic_ : std::string("disabled"));
 
     add("imu_corrected.enable", imu_corrected_enable_ ? "true" : "false");
     add("imu_corrected.apply_tf", imu_corrected_apply_tf_ ? "true" : "false");
@@ -1874,9 +2439,26 @@ void GyroOdometerNode::onPublishTimer()
       add("lidar_raw_dyaw", std::to_string(lidar.raw_dyaw));
       add("lidar_v", std::to_string(lidar.v));
       add("lidar_has_hessian", lidar.degeneracy.has_hessian ? "true" : "false");
+      add("degeneracy_detection_enabled", lidar.degeneracy.detection_enabled ? "true" : "false");
+      add("lidar_weak_observation", lidar.degeneracy.weak_observation ? "true" : "false");
+      add("lidar_assist_candidate", lidar.degeneracy.assist_candidate ? "true" : "false");
+      add("lidar_pose_mode", std::to_string(static_cast<int>(lidar.degeneracy.pose_mode)));
+      add("lidar_pose_mode_name", lidarPoseModeToString(lidar.degeneracy.pose_mode));
       add("lidar_degenerate", lidar.degeneracy.degenerate ? "true" : "false");
+      add("scan_rejected", lidar.degeneracy.scan_rejected ? "true" : "false");
+      add("speed_mismatch", lidar.degeneracy.speed_mismatch ? "true" : "false");
+      add("speed_mismatch_streak", std::to_string(lidar.degeneracy.speed_mismatch_streak));
+      add("critical_clear_streak", std::to_string(lidar.degeneracy.critical_clear_streak));
+      add("critical_hold_remaining_sec", std::to_string(lidar.degeneracy.critical_hold_remaining_sec));
       add("wheel_assist_active", lidar.degeneracy.wheel_assisted ? "true" : "false");
+      add("wheel_assist_strong", lidar.degeneracy.wheel_assisted_strong ? "true" : "false");
+      add("wheel_assist_blend", std::to_string(lidar.degeneracy.assist_blend));
       add("wheel_prior_available", lidar.degeneracy.wheel_prior_available ? "true" : "false");
+      add("stationary_now", lidar.degeneracy.stationary_now ? "true" : "false");
+      add("stationary_drift", lidar.degeneracy.stationary_drift ? "true" : "false");
+      add("prior_conflict", lidar.degeneracy.prior_conflict ? "true" : "false");
+      add("bad_fit", lidar.degeneracy.bad_fit ? "true" : "false");
+      add("force_full_guess_next", lidar.degeneracy.force_full_guess_next ? "true" : "false");
       add("degeneracy_score", std::to_string(lidar.degeneracy.score));
       add("weak_direction_count", std::to_string(lidar.degeneracy.weak_direction_count));
       add("hessian_eig_min", std::to_string(lidar.degeneracy.eig_min));
@@ -1886,6 +2468,13 @@ void GyroOdometerNode::onPublishTimer()
       add("wheel_prior_dx", std::to_string(lidar.degeneracy.prior_dx));
       add("wheel_prior_dy", std::to_string(lidar.degeneracy.prior_dy));
       add("wheel_prior_dyaw", std::to_string(lidar.degeneracy.prior_dyaw));
+      add("prior_conflict_metric", std::to_string(lidar.degeneracy.prior_conflict_metric));
+      add("prior_conflict_trans", std::to_string(lidar.degeneracy.prior_conflict_trans));
+      add("prior_conflict_yaw", std::to_string(lidar.degeneracy.prior_conflict_yaw));
+      add("stationary_drift_metric", std::to_string(lidar.degeneracy.stationary_drift_metric));
+      add("scan_speed_mps", std::to_string(lidar.degeneracy.scan_speed_mps));
+      add("wheel_speed_mps", std::to_string(lidar.degeneracy.wheel_speed_mps));
+      add("speed_diff_mps", std::to_string(lidar.degeneracy.speed_diff_mps));
     }
 
     arr.status.push_back(st);
@@ -1909,10 +2498,27 @@ void GyroOdometerNode::publishDegeneracyDebug(
   oss << "lidar_valid: " << boolString(sample.valid) << "\n";
   oss << "lidar_converged: " << boolString(sample.converged) << "\n";
   oss << "lidar_fitness: " << formatDouble(sample.fitness) << "\n";
+  oss << "degeneracy_detection_enabled: " << boolString(sample.degeneracy.detection_enabled) << "\n";
   oss << "lidar_has_hessian: " << boolString(sample.degeneracy.has_hessian) << "\n";
+  oss << "lidar_weak_observation: " << boolString(sample.degeneracy.weak_observation) << "\n";
+  oss << "lidar_assist_candidate: " << boolString(sample.degeneracy.assist_candidate) << "\n";
+  oss << "lidar_pose_mode: " << static_cast<int>(sample.degeneracy.pose_mode) << "\n";
+  oss << "lidar_pose_mode_name: " << lidarPoseModeToString(sample.degeneracy.pose_mode) << "\n";
   oss << "lidar_degenerate: " << boolString(sample.degeneracy.degenerate) << "\n";
+  oss << "scan_rejected: " << boolString(sample.degeneracy.scan_rejected) << "\n";
+  oss << "speed_mismatch: " << boolString(sample.degeneracy.speed_mismatch) << "\n";
+  oss << "speed_mismatch_streak: " << sample.degeneracy.speed_mismatch_streak << "\n";
+  oss << "critical_clear_streak: " << sample.degeneracy.critical_clear_streak << "\n";
+  oss << "critical_hold_remaining_sec: " << formatDouble(sample.degeneracy.critical_hold_remaining_sec) << "\n";
   oss << "wheel_prior_available: " << boolString(sample.degeneracy.wheel_prior_available) << "\n";
   oss << "wheel_assist_active: " << boolString(sample.degeneracy.wheel_assisted) << "\n";
+  oss << "wheel_assist_strong: " << boolString(sample.degeneracy.wheel_assisted_strong) << "\n";
+  oss << "wheel_assist_blend: " << formatDouble(sample.degeneracy.assist_blend) << "\n";
+  oss << "prior_conflict: " << boolString(sample.degeneracy.prior_conflict) << "\n";
+  oss << "stationary_now: " << boolString(sample.degeneracy.stationary_now) << "\n";
+  oss << "stationary_drift: " << boolString(sample.degeneracy.stationary_drift) << "\n";
+  oss << "bad_fit: " << boolString(sample.degeneracy.bad_fit) << "\n";
+  oss << "force_full_guess_next: " << boolString(sample.degeneracy.force_full_guess_next) << "\n";
   oss << "weak_direction_count: " << sample.degeneracy.weak_direction_count << "\n";
   oss << "degeneracy_score: " << formatDouble(sample.degeneracy.score) << "\n";
   oss << "hessian_eig_min: " << formatDouble(sample.degeneracy.eig_min) << "\n";
@@ -1928,10 +2534,21 @@ void GyroOdometerNode::publishDegeneracyDebug(
   oss << "wheel_prior_dx: " << formatDouble(sample.degeneracy.prior_dx) << "\n";
   oss << "wheel_prior_dy: " << formatDouble(sample.degeneracy.prior_dy) << "\n";
   oss << "wheel_prior_dyaw: " << formatDouble(sample.degeneracy.prior_dyaw) << "\n";
+  oss << "prior_conflict_metric: " << formatDouble(sample.degeneracy.prior_conflict_metric) << "\n";
+  oss << "prior_conflict_trans: " << formatDouble(sample.degeneracy.prior_conflict_trans) << "\n";
+  oss << "prior_conflict_yaw: " << formatDouble(sample.degeneracy.prior_conflict_yaw) << "\n";
+  oss << "stationary_drift_metric: " << formatDouble(sample.degeneracy.stationary_drift_metric) << "\n";
+  oss << "scan_speed_mps: " << formatDouble(sample.degeneracy.scan_speed_mps) << "\n";
+  oss << "wheel_speed_mps: " << formatDouble(sample.degeneracy.wheel_speed_mps) << "\n";
+  oss << "speed_diff_mps: " << formatDouble(sample.degeneracy.speed_diff_mps) << "\n";
+  oss << "score_thr: " << formatDouble(wheel_degeneracy_score_thr_) << "\n";
+  oss << "prior_blend_strong: " << formatDouble(wheel_degeneracy_prior_blend_) << "\n";
   oss << "rel_eigenvalue_thr: " << formatDouble(wheel_degeneracy_rel_eigenvalue_thr_) << "\n";
   oss << "abs_eigenvalue_thr: " << formatDouble(wheel_degeneracy_abs_eigenvalue_thr_) << "\n";
   oss << "yaw_metric_m: " << formatDouble(wheel_degeneracy_yaw_metric_m_) << "\n";
-  oss << "prior_blend: " << formatDouble(wheel_degeneracy_prior_blend_) << "\n";
+  oss << "critical_hold_sec: " << formatDouble(wheel_degeneracy_latch_hold_sec_) << "\n";
+  oss << "critical_clear_frames: " << wheel_degeneracy_latch_off_streak_thr_ << "\n";
+  oss << "scan_wheel_speed_diff_thr_mps: " << formatDouble(wheel_degeneracy_scan_wheel_speed_diff_thr_mps_) << "\n";
   oss << "min_wheel_dist_m: " << formatDouble(wheel_degeneracy_min_wheel_dist_m_) << "\n";
   msg.data = oss.str();
   pub_degeneracy_debug_->publish(msg);

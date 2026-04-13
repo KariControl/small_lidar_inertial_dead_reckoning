@@ -30,6 +30,8 @@ private:
     rclcpp::Time stamp;
     Eigen::Isometry3d T_odom_base{Eigen::Isometry3d::Identity()};
     geometry_msgs::msg::Twist twist;
+    double cov_xy_total{0.0};
+    double cov_yaw_total{0.0};
   };
 
   struct AbsolutePoseMeasurement
@@ -50,6 +52,8 @@ private:
     Eigen::Isometry3d T_map_odom{Eigen::Isometry3d::Identity()};
     double cov_xy{0.25};
     double cov_yaw{0.04};
+    double odom_cov_xy_ref{0.0};
+    double odom_cov_yaw_ref{0.0};
     std::string source{"none"};
   };
 
@@ -143,6 +147,14 @@ private:
   double gnss_max_cov_yaw_{10.0};
   double gnss_position_jump_reject_m_{20.0};
   double gnss_yaw_jump_reject_rad_{1.57};
+
+  // Additional GNSS gain boost when dead-reckoning covariance has grown.
+  double odom_cov_ref_xy_{0.50};
+  double odom_cov_ref_yaw_{0.10};
+  double odom_max_cov_xy_{100.0};
+  double odom_max_cov_yaw_{10.0};
+  double odom_alpha_boost_xy_{0.35};
+  double odom_alpha_boost_yaw_{0.20};
 
   // State
   mutable std::mutex mtx_;

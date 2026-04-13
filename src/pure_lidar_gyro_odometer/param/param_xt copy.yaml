@@ -8,7 +8,7 @@
     imu_topic: /imu
     # Wheel speed input (geometry_msgs/TwistStamped).
     # When wheel_speed.use=true, wheel speed is used for critical-degeneracy support and reject fallback only.
-    wheel_speed_topic: ""
+    wheel_speed_topic: /vehicle/twist
     # Optional reference pose (PoseWithCovarianceStamped) for wheel speed scale estimation (e.g. /localization/ndt_pose)
     reference_pose_topic: ""
     # LiDAR points for scan-to-scan odometry (undistorted point cloud is recommended)
@@ -46,13 +46,13 @@
     stop.hold_sec: 0.5
 
     # Gyro bias estimation (only updated while stopped)
-    gyro_bias.enable: false
+    gyro_bias.enable: true
     gyro_bias.tau_sec: 10.0
     gyro_bias.max_abs_rad_s: 0.5
     gyro_bias.initial_bg_rad_s: 0.0
 
     # Wheel speed input and optional low-speed correction
-    wheel_speed.use: false
+    wheel_speed.use: true
     wheel_speed.scale_factor: 1.0
     wheel_speed.timeout_sec: 0.2
 
@@ -73,7 +73,7 @@
     # Hessian-based degeneracy detection and wheel+IMU arc-motion assist.
     # The weak directions are detected from small_gicp final Hessian, then only those
     # directions are nudged toward the wheel+IMU arc-motion prior.
-    wheel_speed.degeneracy.enable: false
+    wheel_speed.degeneracy.enable: true
     # Yaw unit normalization for Hessian eigen-analysis [m/rad].
     wheel_speed.degeneracy.yaw_metric_m: 2.0
     # Weak direction if lambda_i / lambda_max is smaller than this threshold.
@@ -84,10 +84,8 @@
     wheel_speed.degeneracy.min_wheel_dist_m: 0.05
     # Global scale for the weak-direction correction toward the wheel+IMU prior.
     wheel_speed.degeneracy.prior_blend: 1.0
-    # Optional low-gain assist that can start before final degeneracy=true.
-    wheel_speed.degeneracy.full_guess_use_current_prior: true
-    wheel_speed.degeneracy.latch_hold_sec: 0.4
-    wheel_speed.degeneracy.latch_off_streak_thr: 4
+    # Accuracy-oriented default: apply wheel correction only after the final
+    # history/prior-consistency gate declares degeneracy=true.
     # Optional std_msgs/String publisher for per-scan degeneracy debug output.
     wheel_speed.degeneracy.debug_pub.enable: true
     wheel_speed.degeneracy.debug_pub.topic: /localization/lidar_degeneracy_debug
@@ -97,13 +95,11 @@
     wheel_speed.degeneracy.prior_conflict.yaw_thr_rad: 0.01
     wheel_speed.degeneracy.prior_conflict.metric_thr_m: 0.08
     wheel_speed.degeneracy.bad_fit_fitness_thr: 1.5
-    # Keeps CRITICAL latched after entry when scan-speed and wheel-speed disagreement persists.
-    # It does not trigger CRITICAL entry by itself.
     wheel_speed.degeneracy.scan_wheel_speed_diff_thr_mps: 1.0
     wheel_speed.degeneracy.stationary.trans_thr_m: 0.03
     wheel_speed.degeneracy.stationary.yaw_thr_rad: 0.01
 
-    # Optional critical degeneracy output for controller/fusion health gating.
+    # Optional final boolean output for controller/fusion health gating.
     out_degeneracy.enable: true
     out_degeneracy_topic: /localization/lidar_degenerate
     out_pose_mode.enable: true
@@ -129,27 +125,28 @@
     lidar_odom.registration_type: VGICP
     lidar_odom.num_threads: 8
     lidar_odom.timeout_sec: 0.5
-    lidar_odom.min_range_m: 1.5
-    lidar_odom.max_range_m: 60.0
-    lidar_odom.voxel_leaf_m: 0.2
+    lidar_odom.min_range_m: 2.0
+    lidar_odom.max_range_m: 80.0
+    lidar_odom.voxel_leaf_m: 0.25
 
-    lidar_odom.gicp.max_corr_dist_m: 1.5
+    lidar_odom.gicp.max_corr_dist_m: 1.8
     lidar_odom.gicp.max_iterations: 50
     lidar_odom.gicp.trans_eps: 1.0e-3
     lidar_odom.gicp.rot_eps: 2.0e-3
     lidar_odom.gicp.corr_randomness: 20
-    lidar_odom.gicp.max_fitness: 4.0
-    lidar_odom.gicp.voxel_resolution: 0.6
+    lidar_odom.gicp.max_fitness: 5.0
+    lidar_odom.gicp.voxel_resolution: 0.8
 
     lidar_odom.pose_se2.enable: true
     lidar_odom.pose_se2.yaw_blend_imu: 0.0
-    # Normally use IMU yaw-only guess. Critical/reject intervals can force the next ICP to use a full wheel+IMU prior.
+    # Normally use IMU yaw-only guess. When the previous LiDAR interval was judged degenerate,
+    # the node temporarily keeps the full corrected guess for the next ICP.
     lidar_odom.pose_se2.guess_use_imu_yaw_only: true
 
     lidar_odom.smoother.enable: true
     lidar_odom.smoother.window_size: 25
-    lidar_odom.smoother.w_imu: 0.0001
-    lidar_odom.smoother.w_scan: 2.0
+    lidar_odom.smoother.w_imu: 10.0
+    lidar_odom.smoother.w_scan: 1.5
     lidar_odom.smoother.lambda: 0.2
     lidar_odom.smoother.fitness_sigma: 0.5
     lidar_odom.smoother.min_scan_weight: 0.1
@@ -157,12 +154,12 @@
 
     # Optional zero-velocity update (ZUPT) factor in the mini smoother.
     # Applies only when stop detection is active and the interval is classified as stationary.
-    lidar_odom.smoother.zupt.enable: false
+    lidar_odom.smoother.zupt.enable: true
     lidar_odom.smoother.zupt.w_trans: 25.0
     lidar_odom.smoother.zupt.w_yaw: 25.0
 
     # Optional midpoint non-holonomic constraint (NHC).
     # Constrains lateral motion in the body frame at the interval midpoint orientation.
-    lidar_odom.smoother.nhc.enable: false
+    lidar_odom.smoother.nhc.enable: true
     lidar_odom.smoother.nhc.w_lateral: 2.0
     lidar_odom.smoother.nhc.huber_delta_m: 0.10

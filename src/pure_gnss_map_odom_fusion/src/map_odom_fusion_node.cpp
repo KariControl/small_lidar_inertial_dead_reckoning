@@ -148,6 +148,12 @@ MapOdomFusionNode::MapOdomFusionNode(const rclcpp::NodeOptions & options)
   gnss_max_cov_yaw_ = declare_parameter<double>("gnss_max_cov_yaw", gnss_max_cov_yaw_);
   gnss_position_jump_reject_m_ = declare_parameter<double>("gnss_position_jump_reject_m", gnss_position_jump_reject_m_);
   gnss_yaw_jump_reject_rad_ = declare_parameter<double>("gnss_yaw_jump_reject_rad", gnss_yaw_jump_reject_rad_);
+  odom_cov_ref_xy_ = declare_parameter<double>("odom_cov_ref_xy", odom_cov_ref_xy_);
+  odom_cov_ref_yaw_ = declare_parameter<double>("odom_cov_ref_yaw", odom_cov_ref_yaw_);
+  odom_max_cov_xy_ = declare_parameter<double>("odom_max_cov_xy", odom_max_cov_xy_);
+  odom_max_cov_yaw_ = declare_parameter<double>("odom_max_cov_yaw", odom_max_cov_yaw_);
+  odom_alpha_boost_xy_ = declare_parameter<double>("odom_alpha_boost_xy", odom_alpha_boost_xy_);
+  odom_alpha_boost_yaw_ = declare_parameter<double>("odom_alpha_boost_yaw", odom_alpha_boost_yaw_);
 
   sub_odom_ = create_subscription<nav_msgs::msg::Odometry>(
     odom_topic_, rclcpp::SensorDataQoS(),
@@ -427,6 +433,10 @@ void MapOdomFusionNode::applyMeasurement(const AbsolutePoseMeasurement & meas, c
   const Eigen::Vector3d meas_t = meas.T_map_base.translation();
   const double pred_yaw = yawFromIso(T_map_base_pred);
   const double meas_yaw = yawFromIso(meas.T_map_base);
+  const double odom_cov_xy_since_anchor =
+    has_anchor ? std::max(0.0, od.cov_xy_total - current_anchor.odom_cov_xy_ref) : od.cov_xy_total;
+  const double odom_cov_yaw_since_anchor =
+    has_anchor ? std::max(0.0, od.cov_yaw_total - current_anchor.odom_cov_yaw_ref) : od.cov_yaw_total;
 
   GnssFixState fix_state = GnssFixState::GOOD;
   double alpha_xy = 1.0;
@@ -461,6 +471,17 @@ void MapOdomFusionNode::applyMeasurement(const AbsolutePoseMeasurement & meas, c
       }
     }
 
+    if (fix_state == GnssFixState::GOOD) {
+      const double odom_need_xy =
+        1.0 - qualityFromCovariance(odom_cov_xy_since_anchor, odom_cov_ref_xy_, odom_max_cov_xy_);
+      alpha_xy = clamp01(alpha_xy + odom_alpha_boost_xy_ * odom_need_xy);
+      if (meas.yaw_valid) {
+        const double odom_need_yaw =
+          1.0 - qualityFromCovariance(odom_cov_yaw_since_anchor, odom_cov_ref_yaw_, odom_max_cov_yaw_);
+        alpha_yaw = clamp01(alpha_yaw + odom_alpha_boost_yaw_ * odom_need_yaw);
+      }
+    }
+
     alpha_xy = clamp01(alpha_xy);
     alpha_yaw = clamp01(alpha_yaw);
   }
@@ -491,6 +512,8 @@ void MapOdomFusionNode::applyMeasurement(const AbsolutePoseMeasurement & meas, c
     new_anchor.T_map_odom = T_map_base_new * od.T_odom_base.inverse();
     new_anchor.cov_xy = std::isfinite(meas.cov_xy) && meas.cov_xy >= 0.0 ? meas.cov_xy : anchor_cov_xy_default_;
     new_anchor.cov_yaw = (meas.yaw_valid && std::isfinite(meas.cov_yaw) && meas.cov_yaw >= 0.0) ? meas.cov_yaw : anchor_cov_yaw_default_;
+    new_anchor.odom_cov_xy_ref = od.cov_xy_total;
+    new_anchor.odom_cov_yaw_ref = od.cov_yaw_total;
     new_anchor.source = meas.source + "_init";
 
     {
@@ -542,6 +565,8 @@ void MapOdomFusionNode::applyMeasurement(const AbsolutePoseMeasurement & meas, c
   AnchorState new_anchor = current_anchor;
   new_anchor.stamp = meas.stamp;
   new_anchor.T_map_odom = T_map_base_upd * od.T_odom_base.inverse();
+  new_anchor.odom_cov_xy_ref = od.cov_xy_total;
+  new_anchor.odom_cov_yaw_ref = od.cov_yaw_total;
   if (meas.source == "gnss") {
     new_anchor.cov_xy = (1.0 - alpha_xy) * current_anchor.cov_xy + alpha_xy * meas_cov_xy;
     new_anchor.cov_yaw = (1.0 - alpha_yaw) * current_anchor.cov_yaw + alpha_yaw * meas_cov_yaw;
@@ -571,6 +596,14 @@ void MapOdomFusionNode::onOdom(const nav_msgs::msg::Odometry::SharedPtr msg)
   s.stamp = rclcpp::Time(msg->header.stamp);
   s.T_odom_base = poseMsgToIso(msg->pose.pose);
   s.twist = msg->twist.twist;
+  auto sanitize_cov = [](double v) {
+      if (!std::isfinite(v) || v < 0.0) {
+        return 0.0;
+      }
+      return v;
+    };
+  s.cov_xy_total = 0.5 * (sanitize_cov(msg->pose.covariance[0]) + sanitize_cov(msg->pose.covariance[7]));
+  s.cov_yaw_total = sanitize_cov(msg->pose.covariance[35]);
 
   {
     std::lock_guard<std::mutex> lk(mtx_);
@@ -688,8 +721,10 @@ void MapOdomFusionNode::publishFused(
   const double anchor_age = std::max(0.0, (stamp - anchor_stamp).seconds());
   const GnssFixState fix_state = gnssFixState(stamp);
   const double drift_scale = (fix_state == GnssFixState::BAD) ? no_fix_cov_drift_scale_ : 1.0;
-  const double cov_xy = anchor.cov_xy + cov_xy_drift_per_sec_ * drift_scale * anchor_age;
-  const double cov_yaw = anchor.cov_yaw + cov_yaw_drift_per_sec_ * drift_scale * anchor_age;
+  const double odom_cov_xy_since_anchor = std::max(0.0, od->cov_xy_total - anchor.odom_cov_xy_ref);
+  const double odom_cov_yaw_since_anchor = std::max(0.0, od->cov_yaw_total - anchor.odom_cov_yaw_ref);
+  const double cov_xy = anchor.cov_xy + odom_cov_xy_since_anchor + cov_xy_drift_per_sec_ * drift_scale * anchor_age;
+  const double cov_yaw = anchor.cov_yaw + odom_cov_yaw_since_anchor + cov_yaw_drift_per_sec_ * drift_scale * anchor_age;
 
   geometry_msgs::msg::PoseWithCovarianceStamped pose;
   pose.header.stamp = stamp;
@@ -709,6 +744,9 @@ void MapOdomFusionNode::publishFused(
   odom.child_frame_id = base_frame_;
   odom.pose = pose.pose;
   odom.twist.twist = od->twist;
+  odom.twist.covariance = {};
+  odom.twist.covariance[0] = 1.0e-3;
+  odom.twist.covariance[35] = std::max(1.0e-5, 0.25 * cov_yaw);
   pub_odom_->publish(odom);
 
   if (publish_tf_ && tf_br_) {
@@ -849,9 +887,13 @@ void MapOdomFusionNode::publishDiag(uint8_t level, const std::string & msg)
     auto od = latestOdom(now());
     if (od) {
       const Eigen::Isometry3d T_map_base = anchor->T_map_odom * od->T_odom_base;
+      const double odom_cov_xy_since_anchor = std::max(0.0, od->cov_xy_total - anchor->odom_cov_xy_ref);
+      const double odom_cov_yaw_since_anchor = std::max(0.0, od->cov_yaw_total - anchor->odom_cov_yaw_ref);
       add("x", std::to_string(T_map_base.translation().x()));
       add("y", std::to_string(T_map_base.translation().y()));
       add("yaw", std::to_string(yawFromIso(T_map_base)));
+      add("odom_cov_xy_since_anchor", std::to_string(odom_cov_xy_since_anchor));
+      add("odom_cov_yaw_since_anchor", std::to_string(odom_cov_yaw_since_anchor));
     }
   }
 

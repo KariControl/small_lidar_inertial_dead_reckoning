@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -13,6 +14,7 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/string.hpp>
+#include <std_msgs/msg/u_int8.hpp>
 
 #include <rclcpp/rclcpp.hpp>
 
@@ -50,12 +52,32 @@ private:
 
   struct DegeneracyInfo
   {
+    bool detection_enabled{false};
     bool has_hessian{false};
+    bool weak_observation{false};
+    bool assist_candidate{false};
+    bool assist_latched{false};
     bool degenerate{false};
+    uint8_t pose_mode{0};
     bool wheel_prior_available{false};
     bool wheel_assisted{false};
+    bool wheel_assisted_weak{false};
+    bool wheel_assisted_strong{false};
+    bool prior_conflict{false};
+    bool stationary_now{false};
+    bool stationary_drift{false};
+    bool bad_fit{false};
+    bool scan_rejected{false};
+    bool speed_mismatch{false};
+    bool force_full_guess_next{false};
     int weak_direction_count{0};
+    int weak_observation_streak{0};
+    int bad_evidence_streak{0};
+    int assist_off_streak{0};
     double score{0.0};
+    double assist_blend{0.0};
+    double risk_ema{0.0};
+    double low_obs_hold_remaining_sec{0.0};
     double eig_min{0.0};
     double eig_mid{0.0};
     double eig_max{0.0};
@@ -63,6 +85,16 @@ private:
     double prior_dx{0.0};
     double prior_dy{0.0};
     double prior_dyaw{0.0};
+    double prior_conflict_metric{0.0};
+    double prior_conflict_trans{0.0};
+    double prior_conflict_yaw{0.0};
+    double stationary_drift_metric{0.0};
+    double scan_speed_mps{0.0};
+    double wheel_speed_mps{0.0};
+    double speed_diff_mps{0.0};
+    int speed_mismatch_streak{0};
+    double critical_hold_remaining_sec{0.0};
+    int critical_clear_streak{0};
   };
 
   struct LidarOdomSample
@@ -126,8 +158,8 @@ private:
   std::string reference_pose_topic_;
   std::string points_topic_;
 
-  std::string out_twist_topic_;
-  std::string out_odom_topic_;
+  std::string out_odom_topic_;  // raw odom
+  std::string out_filtered_odom_topic_;
   std::string out_stopped_topic_;
 
   // Publish IMU corrected into base_frame (TF-applied + yaw gyro bias corrected)
@@ -137,6 +169,13 @@ private:
   bool imu_corrected_transform_orientation_{false};
 
   double publish_rate_hz_{50.0};
+  bool out_filtered_odom_enable_{true};
+  bool filtered_odom_zero_when_stopped_{true};
+  double filtered_odom_lowpass_alpha_{0.85};
+  double filtered_odom_linear_rate_limit_mps2_{4.0};
+  double filtered_odom_lateral_rate_limit_mps2_{2.0};
+  double filtered_odom_yaw_rate_limit_radps2_{1.5};
+  double filtered_odom_reset_gap_sec_{1.0};
 
   // Stop detection
   bool stop_enable_{true};
@@ -176,8 +215,49 @@ private:
   double wheel_degeneracy_abs_eigenvalue_thr_{0.0};
   double wheel_degeneracy_min_wheel_dist_m_{0.05};
   double wheel_degeneracy_prior_blend_{1.0};
+  // Deprecated compatibility parameters kept as no-op so older YAML files still load.
+  double wheel_degeneracy_prior_blend_weak_{0.0};
+  double wheel_degeneracy_assist_score_thr_{0.25};
+  bool wheel_degeneracy_assist_only_when_degenerate_{true};
+  bool wheel_degeneracy_speed_override_only_when_degenerate_{true};
+  bool wheel_degeneracy_force_full_guess_on_assist_candidate_{false};
+  bool wheel_degeneracy_full_guess_use_current_prior_{true};
+  double wheel_degeneracy_latch_hold_sec_{0.5};
+  int wheel_degeneracy_latch_off_streak_thr_{6};
+  double wheel_degeneracy_score_thr_{0.25};
+  int wheel_degeneracy_bad_streak_thr_{2};
+  double wheel_degeneracy_risk_ema_alpha_{0.7};
+  double wheel_degeneracy_risk_on_thr_{0.55};
+  double wheel_degeneracy_risk_off_thr_{0.35};
+  double wheel_degeneracy_prior_conflict_trans_thr_m_{0.05};
+  double wheel_degeneracy_prior_conflict_yaw_thr_rad_{0.01};
+  double wheel_degeneracy_prior_conflict_metric_thr_m_{0.08};
+  double wheel_degeneracy_bad_fit_fitness_thr_{1.5};
+  double wheel_degeneracy_scan_wheel_speed_diff_thr_mps_{1.0};
+  double wheel_degeneracy_stationary_trans_thr_m_{0.03};
+  double wheel_degeneracy_stationary_yaw_thr_rad_{0.01};
   bool wheel_degeneracy_debug_pub_enable_{false};
   std::string wheel_degeneracy_debug_topic_{"/localization/lidar_degeneracy_debug"};
+
+  // Optional boolean output for controller/fusion health gating.
+  bool out_degeneracy_enable_{true};
+  std::string out_degeneracy_topic_{"/localization/lidar_degenerate"};
+  bool out_pose_mode_enable_{true};
+  std::string out_pose_mode_topic_{"/localization/lidar_pose_mode"};
+
+  // Cumulative local odometry covariance (published in out_odom_topic).
+  double odom_cov_base_xy_step_{1.0e-4};
+  double odom_cov_base_yaw_step_{2.5e-5};
+  double odom_cov_xy_per_meter_{5.0e-4};
+  double odom_cov_yaw_per_rad_{5.0e-3};
+  double odom_cov_fitness_xy_scale_{5.0e-4};
+  double odom_cov_fitness_yaw_scale_{5.0e-4};
+  double odom_cov_degenerate_scale_{4.0};
+  double odom_cov_wheel_assist_scale_{1.5};
+  double odom_cov_invalid_xy_step_{2.5e-2};
+  double odom_cov_invalid_yaw_step_{1.0e-2};
+  double odom_cov_deadreckon_xy_per_sec_{2.0e-2};
+  double odom_cov_deadreckon_yaw_per_sec_{5.0e-3};
 
   // LiDAR odometry
   bool lidar_odom_enable_{true};
@@ -221,9 +301,11 @@ private:
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr sub_ref_pose_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_points_;
 
-  rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr pub_twist_;
-  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_odom_;
+  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_odom_raw_;
+  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_odom_filtered_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pub_stopped_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pub_degenerate_;
+  rclcpp::Publisher<std_msgs::msg::UInt8>::SharedPtr pub_pose_mode_;
   rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr pub_imu_corrected_;
   rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr pub_diag_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pub_degeneracy_debug_;
@@ -253,6 +335,23 @@ private:
   bool has_wheel_{false};
   double v_acc_est_{0.0};
   bool has_v_acc_{false};
+  bool has_raw_publish_pose_{false};
+  double last_raw_publish_x_{0.0};
+  double last_raw_publish_y_{0.0};
+  double last_raw_publish_yaw_{0.0};
+  rclcpp::Time last_raw_publish_stamp_;
+
+  bool has_filtered_publish_state_{false};
+  double filtered_pub_x_{0.0};
+  double filtered_pub_y_{0.0};
+  double filtered_pub_yaw_{0.0};
+  double filtered_pub_dx_{0.0};
+  double filtered_pub_dy_{0.0};
+  double filtered_pub_dyaw_{0.0};
+  double filtered_pub_vx_{0.0};
+  double filtered_pub_vy_{0.0};
+  double filtered_pub_yaw_rate_{0.0};
+  rclcpp::Time last_filtered_publish_stamp_;
 
   // Online scale estimation
   bool has_ref_pose_{false};
@@ -289,6 +388,14 @@ private:
   bool next_icp_force_full_guess_{false};
   std::string last_icp_guess_mode_{"identity"};
   std::string next_icp_guess_mode_{"yaw_only"};
+  bool degeneracy_state_{false};
+  bool has_critical_latch_until_{false};
+  rclcpp::Time critical_latch_until_;
+  int weak_observation_streak_{0};
+  int speed_mismatch_streak_{0};
+  int critical_clear_streak_{0};
+  double odom_cov_total_xy_{0.0};
+  double odom_cov_total_yaw_{0.0};
 
   // Fixed-lag smoothing state for local odometry
   std::deque<ScanFactor> scan_factor_buf_;

@@ -59,3 +59,11 @@
     # Large innovation rejection / down-weighting.
     gnss_position_jump_reject_m: 20.0
     gnss_yaw_jump_reject_rad: 1.57
+
+    # Additional GNSS gain boost when the dead-reckoning covariance has grown.
+    odom_cov_ref_xy: 0.50
+    odom_cov_ref_yaw: 0.10
+    odom_max_cov_xy: 100.0
+    odom_max_cov_yaw: 10.0
+    odom_alpha_boost_xy: 0.35
+    odom_alpha_boost_yaw: 0.20
