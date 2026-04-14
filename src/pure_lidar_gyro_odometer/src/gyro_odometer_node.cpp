@@ -1790,6 +1790,7 @@ void GyroOdometerNode::onPoints(const sensor_msgs::msg::PointCloud2::SharedPtr m
 
   LidarOdomSample out;
   out.stamp = stamp;
+  out.dt = dt;
   out.valid =
     ((std::isfinite(fitness) && (fitness <= gicp_fitness_max_) && dt > 0.0 && !degeneracy.scan_rejected) ||
     deadreckon_fallback_used);
@@ -1801,6 +1802,14 @@ void GyroOdometerNode::onPoints(const sensor_msgs::msg::PointCloud2::SharedPtr m
   out.dx = delta_used.x();
   out.dy = delta_used.y();
   out.dyaw = delta_used.z();
+  if (dt > 1e-6) {
+    out.raw_vx = out.raw_dx / dt;
+    out.raw_vy = out.raw_dy / dt;
+    out.raw_yaw_rate = out.raw_dyaw / dt;
+    out.vx = out.dx / dt;
+    out.vy = out.dy / dt;
+    out.yaw_rate = out.dyaw / dt;
+  }
   out.degeneracy = degeneracy;
   if (out.valid && dt > 1e-6) {
     if ((out.degeneracy.degenerate || out.degeneracy.scan_rejected) && out.degeneracy.wheel_prior_available) {
@@ -2210,25 +2219,22 @@ void GyroOdometerNode::onPublishTimer()
     odom_y = pred_y;
     odom_yaw = pred_yaw;
 
-    const double dt_raw_pub = has_raw_publish_pose_ ? (nowt - last_raw_publish_stamp_).seconds() : 0.0;
-    if (has_raw_publish_pose_ && std::isfinite(dt_raw_pub) && dt_raw_pub > 1e-4 && dt_raw_pub < 1.0) {
-      const Eigen::Vector3d delta_raw_pub =
-        se2LocalDelta(last_raw_publish_x_, last_raw_publish_y_, last_raw_publish_yaw_, odom_x, odom_y, odom_yaw);
-      raw_twist_x = delta_raw_pub.x() / dt_raw_pub;
-      raw_twist_y = delta_raw_pub.y() / dt_raw_pub;
-      raw_twist_yaw = delta_raw_pub.z() / dt_raw_pub;
+    if (has_lidar && std::isfinite(lidar.dt) && lidar.dt > 1e-6) {
+      raw_twist_x = lidar.vx;
+      raw_twist_y = lidar.vy;
+      raw_twist_yaw = has_yaw_rate_out ? yaw_rate_out : lidar.yaw_rate;
       has_raw_twist = true;
+    } else if (has_v_pred || has_yaw_rate_out) {
+      raw_twist_x = has_v_pred ? v_pred : 0.0;
+      raw_twist_y = 0.0;
+      raw_twist_yaw = has_yaw_rate_out ? yaw_rate_out : 0.0;
+      has_raw_twist = has_v_pred || has_yaw_rate_out;
     } else {
       raw_twist_x = 0.0;
       raw_twist_y = 0.0;
-      raw_twist_yaw = has_yaw_rate_out ? yaw_rate_out : 0.0;
-      has_raw_twist = has_yaw_rate_out;
+      raw_twist_yaw = 0.0;
+      has_raw_twist = false;
     }
-    last_raw_publish_x_ = odom_x;
-    last_raw_publish_y_ = odom_y;
-    last_raw_publish_yaw_ = odom_yaw;
-    last_raw_publish_stamp_ = nowt;
-    has_raw_publish_pose_ = true;
 
     if (out_filtered_odom_enable_ && !out_filtered_odom_topic_.empty() && out_filtered_odom_topic_ != out_odom_topic_) {
       const double dt_filtered = has_filtered_publish_state_ ? (nowt - last_filtered_publish_stamp_).seconds() : 0.0;
@@ -2245,9 +2251,15 @@ void GyroOdometerNode::onPublishTimer()
         filtered_pub_dx_ = 0.0;
         filtered_pub_dy_ = 0.0;
         filtered_pub_dyaw_ = 0.0;
-        filtered_pub_vx_ = 0.0;
-        filtered_pub_vy_ = 0.0;
-        filtered_pub_yaw_rate_ = 0.0;
+        if (filtered_odom_zero_when_stopped_ && stopped_now) {
+          filtered_pub_vx_ = 0.0;
+          filtered_pub_vy_ = 0.0;
+          filtered_pub_yaw_rate_ = 0.0;
+        } else {
+          filtered_pub_vx_ = has_raw_twist ? raw_twist_x : 0.0;
+          filtered_pub_vy_ = has_raw_twist ? raw_twist_y : 0.0;
+          filtered_pub_yaw_rate_ = has_raw_twist ? raw_twist_yaw : (has_yaw_rate_out ? yaw_rate_out : 0.0);
+        }
         has_filtered_publish_state_ = true;
       } else if (filtered_odom_zero_when_stopped_ && stopped_now) {
         filtered_pub_dx_ = 0.0;
@@ -2257,11 +2269,9 @@ void GyroOdometerNode::onPublishTimer()
         filtered_pub_vy_ = 0.0;
         filtered_pub_yaw_rate_ = 0.0;
       } else {
-        const Eigen::Vector3d delta_to_raw =
-          se2LocalDelta(filtered_pub_x_, filtered_pub_y_, filtered_pub_yaw_, odom_x, odom_y, odom_yaw);
-        const double target_vx = delta_to_raw.x() / dt_filtered;
-        const double target_vy = delta_to_raw.y() / dt_filtered;
-        const double target_w = delta_to_raw.z() / dt_filtered;
+        const double target_vx = has_raw_twist ? raw_twist_x : 0.0;
+        const double target_vy = has_raw_twist ? raw_twist_y : 0.0;
+        const double target_w = has_raw_twist ? raw_twist_yaw : (has_yaw_rate_out ? yaw_rate_out : 0.0);
 
         const double alpha = clamp01(filtered_odom_lowpass_alpha_);
         double cmd_vx = alpha * filtered_pub_vx_ + (1.0 - alpha) * target_vx;

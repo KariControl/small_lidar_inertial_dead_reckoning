@@ -12,8 +12,8 @@ wait_for_topic_once() {
   echo "[wait] ${topic} is available"
 }
 
-IMU_PARAM=$(ros2 pkg prefix pure_imu_undistortion)/share/pure_imu_undistortion/param/param.yaml
-ODOM_PARAM=$(ros2 pkg prefix pure_lidar_gyro_odometer)/share/pure_lidar_gyro_odometer/param/param.yaml
+IMU_PARAM=$(ros2 pkg prefix pure_imu_undistortion)/share/pure_imu_undistortion/param/param_vel.yaml
+ODOM_PARAM=$(ros2 pkg prefix pure_lidar_gyro_odometer)/share/pure_lidar_gyro_odometer/param/param_vel.yaml
 GNSS_FUSION_PARAM=$(ros2 pkg prefix pure_gnss_map_odom_fusion)/share/pure_gnss_map_odom_fusion/param/param.yaml
 
 # === Static TFs (sensor extrinsics) ===
@@ -54,7 +54,7 @@ wait_for_topic_once /localization/gyro_lidar_odom
 gnome-terminal -- ros2 bag record \
   /localization/gyro_lidar_odom \
   /localization/gyro_lidar_odom_filtered \
-  /localization/lidar_degenerate \
+  /localization/lidar_degenerate/debug \
   /localization/ekf_odom \
   /localization/gnss_odometry \
   /localization/gnss_fusion_input

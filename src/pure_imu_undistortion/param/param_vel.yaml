@@ -1,0 +1,33 @@
+imu_undistorter:
+  ros__parameters:
+    base_frame: "base_link"
+    imu_frame: "imu"     
+    scan_frame: "velodyne"    # 空ならPointCloud2.header.frame_id
+
+    points_in_topic: "/converted_points"
+    points_out_topic: "/localization/points_undistorted"
+    imu_topic: "/imu"
+    twist_topic: ""   # 車載用: deskew に車速を使用
+
+    # 点時間フィールド混在対策
+    time_fields: ["time","t","timestamp","offset_time","time_stamp"]
+    prefer_relative_time: true
+    time_scale: 0.0                  # 0 => 自動推定（ns/us/ms/s）
+    fallback_scan_period: 0.05       # time無い場合のスキャン周期（Hesai XTM 想定）
+    cloud_stamp_is_start: true       # stamp が scan start なら true（end なら false）
+    reference_time: "start"          # "start" or "end"
+
+    # バッファ
+    imu_buffer_sec: 2.0
+    twist_buffer_sec: 2.0
+    max_imu_gap_sec: 0.02
+    max_time_offset_sec: 0.2
+
+    # 並進補正（オプション）
+    use_translation: true
+    use_twist_speed: true
+    default_speed_mps: 0.0
+    max_speed_mps: 40.0
+
+    publish_diagnostics: true
+    diag_throttle_ms: 1000

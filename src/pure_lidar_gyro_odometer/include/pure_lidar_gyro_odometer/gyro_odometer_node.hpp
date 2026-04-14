@@ -100,6 +100,7 @@ private:
   struct LidarOdomSample
   {
     rclcpp::Time stamp;
+    double dt{0.0};
     bool valid{false};
     bool converged{false};
     double fitness{0.0};
@@ -107,9 +108,15 @@ private:
     double dy{0.0};
     double dyaw{0.0};
     double v{0.0};
+    double vx{0.0};
+    double vy{0.0};
+    double yaw_rate{0.0};
     double raw_dx{0.0};
     double raw_dy{0.0};
     double raw_dyaw{0.0};
+    double raw_vx{0.0};
+    double raw_vy{0.0};
+    double raw_yaw_rate{0.0};
     DegeneracyInfo degeneracy;
   };
 
@@ -335,11 +342,6 @@ private:
   bool has_wheel_{false};
   double v_acc_est_{0.0};
   bool has_v_acc_{false};
-  bool has_raw_publish_pose_{false};
-  double last_raw_publish_x_{0.0};
-  double last_raw_publish_y_{0.0};
-  double last_raw_publish_yaw_{0.0};
-  rclcpp::Time last_raw_publish_stamp_;
 
   bool has_filtered_publish_state_{false};
   double filtered_pub_x_{0.0};
