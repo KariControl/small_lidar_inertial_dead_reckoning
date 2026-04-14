@@ -7,7 +7,7 @@ imu_undistorter:
     points_in_topic: "/converted_points"
     points_out_topic: "/localization/points_undistorted"
     imu_topic: "/imu"
-    twist_topic: ""   # 車載用: deskew に車速を使用
+    twist_topic: "/localization/deskew_twist"   # 車載用: deskew に車速を使用
 
     # 点時間フィールド混在対策
     time_fields: ["time","t","timestamp","offset_time","time_stamp"]

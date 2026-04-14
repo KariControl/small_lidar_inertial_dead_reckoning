@@ -317,7 +317,11 @@ private:
   rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr pub_diag_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pub_degeneracy_debug_;
 
+
   rclcpp::TimerBase::SharedPtr timer_;
+  // 追加: gyro_odometer_node.hpp
+  rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr pub_deskew_twist_;
+  std::string out_deskew_twist_topic_;
 
   // -------- State --------
   mutable std::mutex mtx_;

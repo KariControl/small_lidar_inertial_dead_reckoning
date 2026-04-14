@@ -513,6 +513,14 @@ GyroOdometerNode::GyroOdometerNode(const rclcpp::NodeOptions & options)
     pub_degeneracy_debug_ = create_publisher<std_msgs::msg::String>(wheel_degeneracy_debug_topic_, 10);
   }
 
+  // 追加: コンストラクタ
+  out_deskew_twist_topic_ =
+    declare_parameter<std::string>("out_deskew_twist_topic", "/localization/deskew_twist");
+
+  pub_deskew_twist_ =
+    create_publisher<geometry_msgs::msg::TwistStamped>(
+      out_deskew_twist_topic_, rclcpp::SensorDataQoS());
+
   // Subscribers
   sub_imu_ = create_subscription<sensor_msgs::msg::Imu>(
     imu_topic_, rclcpp::SensorDataQoS(),
@@ -2350,6 +2358,17 @@ void GyroOdometerNode::onPublishTimer()
 
   fillOdom(odom_raw, odom_x, odom_y, odom_yaw, raw_twist_x, raw_twist_y, raw_twist_yaw, has_raw_twist);
   pub_odom_raw_->publish(odom_raw);
+  // 追加: onPoints() で out が確定した直後
+  if (pub_deskew_twist_ ) {
+    geometry_msgs::msg::TwistStamped ts;
+    ts.header.stamp = nowt;
+    ts.header.frame_id = base_frame_;
+    ts.twist.linear.x = raw_twist_x;      // signed forward speed
+    ts.twist.linear.y = raw_twist_y;      // 今の undistorter は未使用
+    ts.twist.angular.z = raw_twist_yaw;
+    pub_deskew_twist_->publish(ts);
+}
+  
 
   if (pub_odom_filtered_ && have_filtered_pose) {
     fillOdom(
